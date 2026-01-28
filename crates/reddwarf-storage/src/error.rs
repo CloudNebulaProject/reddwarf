@@ -13,9 +13,7 @@ pub enum StorageError {
         code(storage::key_not_found),
         help("Verify the key exists in the database")
     )]
-    KeyNotFound {
-        key: String,
-    },
+    KeyNotFound { key: String },
 
     /// Database error
     #[error("Database error: {message}")]
@@ -35,9 +33,7 @@ pub enum StorageError {
         code(storage::transaction_error),
         help("Ensure the transaction is not already committed or aborted")
     )]
-    TransactionError {
-        message: String,
-    },
+    TransactionError { message: String },
 
     /// Serialization error
     #[error("Serialization error: {message}")]

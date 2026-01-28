@@ -7,12 +7,12 @@
 //! - Pod binding to nodes
 
 pub mod error;
-pub mod types;
 pub mod filter;
-pub mod score;
 pub mod scheduler;
+pub mod score;
+pub mod types;
 
 // Re-export commonly used types
-pub use error::{SchedulerError, Result};
+pub use error::{Result, SchedulerError};
 pub use scheduler::Scheduler;
-pub use types::{SchedulingContext, FilterResult, ScoreResult};
+pub use types::{FilterResult, SchedulingContext, ScoreResult};

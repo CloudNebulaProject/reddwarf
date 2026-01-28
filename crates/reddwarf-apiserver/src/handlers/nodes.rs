@@ -1,4 +1,6 @@
-use crate::handlers::common::{create_resource, delete_resource, get_resource, list_resources, update_resource, ListResponse};
+use crate::handlers::common::{
+    create_resource, delete_resource, get_resource, list_resources, update_resource, ListResponse,
+};
 use crate::response::{status_deleted, ApiResponse};
 use crate::validation::validate_resource;
 use crate::{AppState, Result};
@@ -24,9 +26,7 @@ pub async fn get_node(
 }
 
 /// GET /api/v1/nodes
-pub async fn list_nodes(
-    State(state): State<Arc<AppState>>,
-) -> Result<Response> {
+pub async fn list_nodes(State(state): State<Arc<AppState>>) -> Result<Response> {
     let prefix = KeyEncoder::encode_prefix("v1", "Node", None);
     let nodes: Vec<Node> = list_resources(&state, &prefix).await?;
 

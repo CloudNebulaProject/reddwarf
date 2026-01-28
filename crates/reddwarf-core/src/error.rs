@@ -31,10 +31,7 @@ pub enum ReddwarfError {
 
     /// Invalid resource
     #[error("Invalid resource: {reason}")]
-    #[diagnostic(
-        code(reddwarf::invalid_resource),
-        help("{suggestion}")
-    )]
+    #[diagnostic(code(reddwarf::invalid_resource), help("{suggestion}"))]
     InvalidResource {
         #[allow(unused)]
         reason: String,
@@ -44,10 +41,7 @@ pub enum ReddwarfError {
 
     /// Validation failed
     #[error("Validation failed for {resource_type}: {details}")]
-    #[diagnostic(
-        code(reddwarf::validation_failed),
-        help("{help_text}")
-    )]
+    #[diagnostic(code(reddwarf::validation_failed), help("{help_text}"))]
     ValidationFailed {
         #[allow(unused)]
         resource_type: String,
@@ -246,9 +240,7 @@ impl ReddwarfError {
 
     /// Create an InvalidKind error
     pub fn invalid_kind(kind: impl Into<String>) -> Self {
-        Self::InvalidKind {
-            kind: kind.into(),
-        }
+        Self::InvalidKind { kind: kind.into() }
     }
 }
 

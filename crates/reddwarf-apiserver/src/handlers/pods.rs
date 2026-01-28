@@ -1,4 +1,6 @@
-use crate::handlers::common::{create_resource, delete_resource, get_resource, list_resources, update_resource, ListResponse};
+use crate::handlers::common::{
+    create_resource, delete_resource, get_resource, list_resources, update_resource, ListResponse,
+};
 use crate::response::{status_deleted, ApiResponse};
 use crate::validation::validate_resource;
 use crate::{AppState, Result};

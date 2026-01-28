@@ -104,7 +104,10 @@ impl ResourceQuantities {
 
     /// Get CPU and memory from a resource map (k8s-openapi format)
     pub fn from_k8s_resource_map(
-        resources: &std::collections::BTreeMap<String, k8s_openapi::apimachinery::pkg::api::resource::Quantity>,
+        resources: &std::collections::BTreeMap<
+            String,
+            k8s_openapi::apimachinery::pkg::api::resource::Quantity,
+        >,
     ) -> Self {
         let cpu_millicores = resources
             .get("cpu")

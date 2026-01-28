@@ -104,7 +104,10 @@ impl IndexKey {
                 name,
             } => {
                 if let Some(ns) = namespace {
-                    format!("label/{}/{}/{}/{}/{}/{}", key, value, api_version, kind, ns, name)
+                    format!(
+                        "label/{}/{}/{}/{}/{}/{}",
+                        key, value, api_version, kind, ns, name
+                    )
                 } else {
                     format!("label/{}/{}/{}/{}/{}", key, value, api_version, kind, name)
                 }
@@ -118,9 +121,15 @@ impl IndexKey {
                 name,
             } => {
                 if let Some(ns) = namespace {
-                    format!("field/{}/{}/{}/{}/{}/{}", field_path, value, api_version, kind, ns, name)
+                    format!(
+                        "field/{}/{}/{}/{}/{}/{}",
+                        field_path, value, api_version, kind, ns, name
+                    )
                 } else {
-                    format!("field/{}/{}/{}/{}/{}", field_path, value, api_version, kind, name)
+                    format!(
+                        "field/{}/{}/{}/{}/{}",
+                        field_path, value, api_version, kind, name
+                    )
                 }
             }
         }
@@ -165,7 +174,10 @@ mod tests {
     fn test_encode_resource_key() {
         let gvk = GroupVersionKind::from_api_version_kind("v1", "Pod");
         let key = ResourceKey::new(gvk, "default", "nginx");
-        assert_eq!(KeyEncoder::encode_resource_key(&key), "v1/Pod/default/nginx");
+        assert_eq!(
+            KeyEncoder::encode_resource_key(&key),
+            "v1/Pod/default/nginx"
+        );
 
         let gvk = GroupVersionKind::from_api_version_kind("v1", "Node");
         let key = ResourceKey::cluster_scoped(gvk, "node-1");

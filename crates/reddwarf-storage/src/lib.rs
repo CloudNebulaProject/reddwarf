@@ -6,13 +6,13 @@
 //! - Key encoding and indexing
 //! - Transaction support
 
+pub mod encoding;
 pub mod error;
 pub mod kv;
 pub mod redb_backend;
-pub mod encoding;
 
 // Re-export commonly used types
-pub use error::{StorageError, Result};
+pub use encoding::{IndexKey, KeyEncoder};
+pub use error::{Result, StorageError};
 pub use kv::{KVStore, Transaction};
 pub use redb_backend::RedbBackend;
-pub use encoding::{KeyEncoder, IndexKey};

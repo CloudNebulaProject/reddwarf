@@ -193,7 +193,8 @@ impl FilterPredicate for TaintToleration {
                 let toleration_effect = toleration.effect.as_ref();
 
                 if toleration_key.as_ref() == Some(&taint_key)
-                    && (toleration_effect.is_none() || toleration_effect.as_ref() == Some(&taint_effect))
+                    && (toleration_effect.is_none()
+                        || toleration_effect.as_ref() == Some(&taint_effect))
                 {
                     tolerated = true;
                     break;
@@ -203,7 +204,10 @@ impl FilterPredicate for TaintToleration {
             if !tolerated {
                 return FilterResult::fail(
                     node_name,
-                    format!("Pod does not tolerate taint: {}={}", taint_key, taint_effect),
+                    format!(
+                        "Pod does not tolerate taint: {}={}",
+                        taint_key, taint_effect
+                    ),
                 );
             }
         }

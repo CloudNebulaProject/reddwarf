@@ -1,4 +1,6 @@
-use crate::handlers::common::{create_resource, delete_resource, get_resource, list_resources, update_resource, ListResponse};
+use crate::handlers::common::{
+    create_resource, delete_resource, get_resource, list_resources, update_resource, ListResponse,
+};
 use crate::response::{status_deleted, ApiResponse};
 use crate::validation::validate_resource;
 use crate::{AppState, Result};
@@ -24,9 +26,7 @@ pub async fn get_namespace(
 }
 
 /// GET /api/v1/namespaces
-pub async fn list_namespaces(
-    State(state): State<Arc<AppState>>,
-) -> Result<Response> {
+pub async fn list_namespaces(State(state): State<Arc<AppState>>) -> Result<Response> {
     let prefix = KeyEncoder::encode_prefix("v1", "Namespace", None);
     let namespaces: Vec<Namespace> = list_resources(&state, &prefix).await?;
 

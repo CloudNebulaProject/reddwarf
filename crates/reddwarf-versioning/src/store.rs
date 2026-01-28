@@ -37,11 +37,13 @@ impl VersionStore {
         debug!("Creating commit: {}", commit.id);
 
         // Serialize and store the commit
-        let commit_json = serde_json::to_string(&commit)
-            .map_err(|e| VersioningError::internal_error(format!("Failed to serialize commit: {}", e)))?;
+        let commit_json = serde_json::to_string(&commit).map_err(|e| {
+            VersioningError::internal_error(format!("Failed to serialize commit: {}", e))
+        })?;
 
         let commit_key = format!("version:commit:{}", commit.id);
-        self.storage.put(commit_key.as_bytes(), commit_json.as_bytes())?;
+        self.storage
+            .put(commit_key.as_bytes(), commit_json.as_bytes())?;
 
         // Update HEAD
         self.set_head(commit.id.clone())?;
@@ -60,8 +62,9 @@ impl VersionStore {
             .get(commit_key.as_bytes())?
             .ok_or_else(|| VersioningError::commit_not_found(commit_id))?;
 
-        let commit: Commit = serde_json::from_slice(&commit_bytes)
-            .map_err(|e| VersioningError::internal_error(format!("Failed to deserialize commit: {}", e)))?;
+        let commit: Commit = serde_json::from_slice(&commit_bytes).map_err(|e| {
+            VersioningError::internal_error(format!("Failed to deserialize commit: {}", e))
+        })?;
 
         Ok(commit)
     }
@@ -90,8 +93,9 @@ impl VersionStore {
 
         for key in keys {
             let commit_bytes = self.storage.get(&key)?.unwrap();
-            let commit: Commit = serde_json::from_slice(&commit_bytes)
-                .map_err(|e| VersioningError::internal_error(format!("Failed to deserialize commit: {}", e)))?;
+            let commit: Commit = serde_json::from_slice(&commit_bytes).map_err(|e| {
+                VersioningError::internal_error(format!("Failed to deserialize commit: {}", e))
+            })?;
             commits.push(commit);
         }
 
@@ -100,7 +104,10 @@ impl VersionStore {
 
     /// Detect conflicts between two commits
     pub fn detect_conflicts(&self, commit_id1: &str, commit_id2: &str) -> Result<Vec<Conflict>> {
-        debug!("Detecting conflicts between {} and {}", commit_id1, commit_id2);
+        debug!(
+            "Detecting conflicts between {} and {}",
+            commit_id1, commit_id2
+        );
 
         let commit1 = self.get_commit(commit_id1)?;
         let commit2 = self.get_commit(commit_id2)?;
@@ -148,7 +155,11 @@ impl VersionStore {
     }
 
     /// Find the common ancestor of two commits (simplified BFS)
-    pub fn find_common_ancestor(&self, commit_id1: &str, commit_id2: &str) -> Result<Option<String>> {
+    pub fn find_common_ancestor(
+        &self,
+        commit_id1: &str,
+        commit_id2: &str,
+    ) -> Result<Option<String>> {
         let _commit1 = self.get_commit(commit_id1)?;
         let _commit2 = self.get_commit(commit_id2)?;
 
@@ -239,7 +250,11 @@ mod tests {
         // Create a commit
         let change = Change::create("v1/Pod/default/nginx".to_string(), "{}".to_string());
         let commit = store
-            .create_commit(CommitBuilder::new().change(change).message("Initial commit".to_string()))
+            .create_commit(
+                CommitBuilder::new()
+                    .change(change)
+                    .message("Initial commit".to_string()),
+            )
             .unwrap();
 
         assert!(!commit.id.is_empty());
@@ -262,9 +277,16 @@ mod tests {
         let store = VersionStore::new(backend).unwrap();
 
         // Create base commit
-        let change1 = Change::create("v1/Pod/default/nginx".to_string(), "{\"version\":0}".to_string());
+        let change1 = Change::create(
+            "v1/Pod/default/nginx".to_string(),
+            "{\"version\":0}".to_string(),
+        );
         let commit1 = store
-            .create_commit(CommitBuilder::new().change(change1).message("Base".to_string()))
+            .create_commit(
+                CommitBuilder::new()
+                    .change(change1)
+                    .message("Base".to_string()),
+            )
             .unwrap();
 
         // Create two diverging commits from the base

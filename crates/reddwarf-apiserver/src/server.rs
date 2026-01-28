@@ -68,9 +68,7 @@ impl ApiServer {
             )
             .route(
                 "/api/v1/namespaces/{namespace}/services/{name}",
-                get(get_service)
-                    .put(replace_service)
-                    .delete(delete_service),
+                get(get_service).put(replace_service).delete(delete_service),
             )
             // Namespaces
             .route(

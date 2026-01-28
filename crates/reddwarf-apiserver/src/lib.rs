@@ -8,10 +8,10 @@
 //! - WATCH mechanism for streaming updates
 
 pub mod error;
-pub mod server;
 pub mod handlers;
-pub mod state;
 pub mod response;
+pub mod server;
+pub mod state;
 pub mod validation;
 pub mod watch;
 

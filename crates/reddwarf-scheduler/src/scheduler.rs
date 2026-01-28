@@ -3,7 +3,7 @@ use crate::score::{calculate_weighted_score, default_scores, ScoreFunction};
 use crate::types::SchedulingContext;
 use crate::{Result, SchedulerError};
 use reddwarf_core::{Node, Pod};
-use reddwarf_storage::{KeyEncoder, KVStore, RedbBackend};
+use reddwarf_storage::{KVStore, KeyEncoder, RedbBackend};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -110,8 +110,9 @@ impl Scheduler {
         let mut unscheduled = Vec::new();
 
         for (_key, data) in results.iter() {
-            let pod: Pod = serde_json::from_slice(data)
-                .map_err(|e| SchedulerError::internal_error(format!("Failed to deserialize pod: {}", e)))?;
+            let pod: Pod = serde_json::from_slice(data).map_err(|e| {
+                SchedulerError::internal_error(format!("Failed to deserialize pod: {}", e))
+            })?;
 
             // Check if pod is unscheduled
             if let Some(spec) = &pod.spec {
@@ -132,8 +133,9 @@ impl Scheduler {
         let mut nodes = Vec::new();
 
         for (_key, data) in results.iter() {
-            let node: Node = serde_json::from_slice(data)
-                .map_err(|e| SchedulerError::internal_error(format!("Failed to deserialize node: {}", e)))?;
+            let node: Node = serde_json::from_slice(data).map_err(|e| {
+                SchedulerError::internal_error(format!("Failed to deserialize node: {}", e))
+            })?;
             nodes.push(node);
         }
 
@@ -268,8 +270,9 @@ impl Scheduler {
         );
 
         let storage_key = KeyEncoder::encode_resource_key(&key);
-        let data = serde_json::to_vec(&pod)
-            .map_err(|e| SchedulerError::internal_error(format!("Failed to serialize pod: {}", e)))?;
+        let data = serde_json::to_vec(&pod).map_err(|e| {
+            SchedulerError::internal_error(format!("Failed to serialize pod: {}", e))
+        })?;
 
         self.storage.as_ref().put(storage_key.as_bytes(), &data)?;
 

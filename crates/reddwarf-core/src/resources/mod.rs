@@ -39,7 +39,9 @@ pub trait Resource: Serialize + for<'de> Deserialize<'de> + Send + Sync {
     /// Get the ResourceKey
     fn resource_key(&self) -> Result<ResourceKey, ResourceError> {
         let metadata = self.metadata();
-        let name = metadata.name.as_ref()
+        let name = metadata
+            .name
+            .as_ref()
             .ok_or_else(|| ResourceError::MissingField("metadata.name".to_string()))?;
         let namespace = metadata.namespace.clone().unwrap_or_default();
 
@@ -114,13 +116,13 @@ pub fn is_valid_name(name: &str) -> bool {
         return false;
     }
 
-    chars.iter().all(|c| {
-        c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-' || *c == '.'
-    })
+    chars
+        .iter()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-' || *c == '.')
 }
 
 // Implement Resource trait for common k8s-openapi types
-use k8s_openapi::api::core::v1::{Pod, Node, Service, Namespace};
+use k8s_openapi::api::core::v1::{Namespace, Node, Pod, Service};
 
 impl Resource for Pod {
     fn api_version(&self) -> String {
@@ -147,7 +149,7 @@ impl Resource for Pod {
         if let Some(spec) = &self.spec {
             if spec.containers.is_empty() {
                 return Err(ResourceError::ValidationFailed(
-                    "Pod must have at least one container".to_string()
+                    "Pod must have at least one container".to_string(),
                 ));
             }
         } else {

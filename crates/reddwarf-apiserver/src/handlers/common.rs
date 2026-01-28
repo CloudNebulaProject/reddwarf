@@ -1,16 +1,13 @@
 use crate::{ApiError, AppState, Result};
 use reddwarf_core::{Resource, ResourceKey};
-use reddwarf_storage::{KeyEncoder, KVStore};
+use reddwarf_storage::{KVStore, KeyEncoder};
 use reddwarf_versioning::{Change, CommitBuilder};
 use serde::Serialize;
 use tracing::{debug, info};
 use uuid::Uuid;
 
 /// Get a resource from storage
-pub async fn get_resource<T: Resource>(
-    state: &AppState,
-    key: &ResourceKey,
-) -> Result<T> {
+pub async fn get_resource<T: Resource>(state: &AppState, key: &ResourceKey) -> Result<T> {
     debug!("Getting resource: {}", key);
 
     let storage_key = KeyEncoder::encode_resource_key(key);
@@ -25,10 +22,7 @@ pub async fn get_resource<T: Resource>(
 }
 
 /// Create a resource in storage
-pub async fn create_resource<T: Resource>(
-    state: &AppState,
-    mut resource: T,
-) -> Result<T> {
+pub async fn create_resource<T: Resource>(state: &AppState, mut resource: T) -> Result<T> {
     let key = resource
         .resource_key()
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
@@ -51,7 +45,10 @@ pub async fn create_resource<T: Resource>(
     let data = serde_json::to_vec(&resource)?;
 
     // Create commit
-    let change = Change::create(storage_key.clone(), String::from_utf8_lossy(&data).to_string());
+    let change = Change::create(
+        storage_key.clone(),
+        String::from_utf8_lossy(&data).to_string(),
+    );
 
     let commit = state
         .version_store
@@ -73,10 +70,7 @@ pub async fn create_resource<T: Resource>(
 }
 
 /// Update a resource in storage
-pub async fn update_resource<T: Resource>(
-    state: &AppState,
-    mut resource: T,
-) -> Result<T> {
+pub async fn update_resource<T: Resource>(state: &AppState, mut resource: T) -> Result<T> {
     let key = resource
         .resource_key()
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
@@ -115,17 +109,17 @@ pub async fn update_resource<T: Resource>(
     resource.set_resource_version(reddwarf_core::ResourceVersion::new(commit.id().to_string()));
 
     // Update in storage
-    state.storage.as_ref().put(storage_key.as_bytes(), &new_data)?;
+    state
+        .storage
+        .as_ref()
+        .put(storage_key.as_bytes(), &new_data)?;
 
     info!("Updated resource: {} with version {}", key, commit.id());
     Ok(resource)
 }
 
 /// Delete a resource from storage
-pub async fn delete_resource(
-    state: &AppState,
-    key: &ResourceKey,
-) -> Result<()> {
+pub async fn delete_resource(state: &AppState, key: &ResourceKey) -> Result<()> {
     info!("Deleting resource: {}", key);
 
     let storage_key = KeyEncoder::encode_resource_key(key);
@@ -138,7 +132,10 @@ pub async fn delete_resource(
         .ok_or_else(|| ApiError::NotFound(format!("Resource not found: {}", key)))?;
 
     // Create commit
-    let change = Change::delete(storage_key.clone(), String::from_utf8_lossy(&prev_data).to_string());
+    let change = Change::delete(
+        storage_key.clone(),
+        String::from_utf8_lossy(&prev_data).to_string(),
+    );
 
     let commit = state
         .version_store
@@ -157,10 +154,7 @@ pub async fn delete_resource(
 }
 
 /// List resources with optional filtering
-pub async fn list_resources<T: Resource>(
-    state: &AppState,
-    prefix: &str,
-) -> Result<Vec<T>> {
+pub async fn list_resources<T: Resource>(state: &AppState, prefix: &str) -> Result<Vec<T>> {
     debug!("Listing resources with prefix: {}", prefix);
 
     let results = state.storage.as_ref().scan(prefix.as_bytes())?;

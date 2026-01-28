@@ -21,7 +21,10 @@ impl RedbBackend {
         info!("Opening redb database at: {}", path.as_ref().display());
 
         let db = Database::create(path.as_ref()).map_err(|e| {
-            StorageError::database_error(format!("Failed to create database: {}", e), Some(Box::new(e)))
+            StorageError::database_error(
+                format!("Failed to create database: {}", e),
+                Some(Box::new(e)),
+            )
         })?;
 
         // Create tables if they don't exist
@@ -87,7 +90,10 @@ impl KVStore for RedbBackend {
     }
 
     fn scan(&self, prefix: &[u8]) -> Result<Vec<(Bytes, Bytes)>> {
-        debug!("Scanning with prefix: {:?}", String::from_utf8_lossy(prefix));
+        debug!(
+            "Scanning with prefix: {:?}",
+            String::from_utf8_lossy(prefix)
+        );
 
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(RESOURCES_TABLE)?;

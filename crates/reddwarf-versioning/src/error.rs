@@ -13,9 +13,7 @@ pub enum VersioningError {
         code(versioning::commit_not_found),
         help("Verify the commit ID is correct and exists in the repository")
     )]
-    CommitNotFound {
-        commit_id: String,
-    },
+    CommitNotFound { commit_id: String },
 
     /// Conflict detected
     #[error("Conflict detected: {message}")]
@@ -30,14 +28,8 @@ pub enum VersioningError {
 
     /// Invalid operation
     #[error("Invalid operation: {message}")]
-    #[diagnostic(
-        code(versioning::invalid_operation),
-        help("{suggestion}")
-    )]
-    InvalidOperation {
-        message: String,
-        suggestion: String,
-    },
+    #[diagnostic(code(versioning::invalid_operation), help("{suggestion}"))]
+    InvalidOperation { message: String, suggestion: String },
 
     /// Storage error
     #[error("Storage error: {0}")]
@@ -49,10 +41,7 @@ pub enum VersioningError {
 
     /// Core error
     #[error("Core error: {0}")]
-    #[diagnostic(
-        code(versioning::core_error),
-        help("This is an internal error")
-    )]
+    #[diagnostic(code(versioning::core_error), help("This is an internal error"))]
     CoreError(#[from] reddwarf_core::ReddwarfError),
 
     /// Internal error
@@ -61,9 +50,7 @@ pub enum VersioningError {
         code(versioning::internal_error),
         help("This is likely a bug. Please report it with full error details")
     )]
-    InternalError {
-        message: String,
-    },
+    InternalError { message: String },
 }
 
 /// Result type for versioning operations

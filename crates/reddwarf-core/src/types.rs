@@ -14,7 +14,11 @@ pub struct GroupVersionKind {
 
 impl GroupVersionKind {
     /// Create a new GVK
-    pub fn new(group: impl Into<String>, version: impl Into<String>, kind: impl Into<String>) -> Self {
+    pub fn new(
+        group: impl Into<String>,
+        version: impl Into<String>,
+        kind: impl Into<String>,
+    ) -> Self {
         Self {
             group: group.into(),
             version: version.into(),
@@ -90,7 +94,11 @@ pub struct ResourceKey {
 
 impl ResourceKey {
     /// Create a new ResourceKey
-    pub fn new(gvk: GroupVersionKind, namespace: impl Into<String>, name: impl Into<String>) -> Self {
+    pub fn new(
+        gvk: GroupVersionKind,
+        namespace: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Self {
         Self {
             gvk,
             namespace: namespace.into(),
@@ -117,7 +125,10 @@ impl ResourceKey {
     pub fn storage_key(&self) -> String {
         let api_version = self.gvk.api_version();
         if self.is_namespaced() {
-            format!("{}/{}/{}/{}", api_version, self.gvk.kind, self.namespace, self.name)
+            format!(
+                "{}/{}/{}/{}",
+                api_version, self.gvk.kind, self.namespace, self.name
+            )
         } else {
             format!("{}/{}/{}", api_version, self.gvk.kind, self.name)
         }
@@ -129,7 +140,10 @@ impl ResourceKey {
         let resource = self.gvk.resource_name();
 
         if self.is_namespaced() {
-            format!("/{}/namespaces/{}/{}/{}", base, self.namespace, resource, self.name)
+            format!(
+                "/{}/namespaces/{}/{}/{}",
+                base, self.namespace, resource, self.name
+            )
         } else {
             format!("/{}/{}/{}", base, resource, self.name)
         }

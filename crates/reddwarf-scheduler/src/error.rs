@@ -13,21 +13,12 @@ pub enum SchedulerError {
         code(scheduler::no_suitable_nodes),
         help("Check node resources, taints, and pod requirements")
     )]
-    NoSuitableNodes {
-        pod_name: String,
-        reason: String,
-    },
+    NoSuitableNodes { pod_name: String, reason: String },
 
     /// Scheduling failed
     #[error("Scheduling failed: {message}")]
-    #[diagnostic(
-        code(scheduler::scheduling_failed),
-        help("{suggestion}")
-    )]
-    SchedulingFailed {
-        message: String,
-        suggestion: String,
-    },
+    #[diagnostic(code(scheduler::scheduling_failed), help("{suggestion}"))]
+    SchedulingFailed { message: String, suggestion: String },
 
     /// Storage error
     #[error("Storage error: {0}")]
@@ -39,10 +30,7 @@ pub enum SchedulerError {
 
     /// Core error
     #[error("Core error: {0}")]
-    #[diagnostic(
-        code(scheduler::core_error),
-        help("This is an internal error")
-    )]
+    #[diagnostic(code(scheduler::core_error), help("This is an internal error"))]
     CoreError(#[from] reddwarf_core::ReddwarfError),
 
     /// Internal error
@@ -51,9 +39,7 @@ pub enum SchedulerError {
         code(scheduler::internal_error),
         help("This is likely a bug. Please report it")
     )]
-    InternalError {
-        message: String,
-    },
+    InternalError { message: String },
 }
 
 /// Result type for scheduler operations

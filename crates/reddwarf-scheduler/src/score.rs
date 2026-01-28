@@ -176,10 +176,7 @@ impl ScoreFunction for BalancedAllocation {
 
 /// Get default scoring functions
 pub fn default_scores() -> Vec<Box<dyn ScoreFunction>> {
-    vec![
-        Box::new(LeastAllocated),
-        Box::new(BalancedAllocation),
-    ]
+    vec![Box::new(LeastAllocated), Box::new(BalancedAllocation)]
 }
 
 /// Calculate weighted score from multiple scoring functions
