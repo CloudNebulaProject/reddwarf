@@ -1,0 +1,24 @@
+[package]
+name = "reddwarf-versioning"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+reddwarf-core = { workspace = true }
+reddwarf-storage = { workspace = true }
+# jj-lib = { workspace = true }  # Reserved for future enhancement
+miette = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+parking_lot = "0.12"
+
+[dev-dependencies]
+tempfile = { workspace = true }

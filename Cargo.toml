@@ -1,0 +1,80 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/reddwarf-core",
+    "crates/reddwarf-storage",
+    "crates/reddwarf-versioning",
+    "crates/reddwarf-apiserver",
+    "crates/reddwarf-scheduler",
+    "crates/reddwarf",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Reddwarf Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yourusername/reddwarf"
+rust-version = "1.84"
+
+[workspace.dependencies]
+# Core dependencies
+reddwarf-core = { path = "crates/reddwarf-core" }
+reddwarf-storage = { path = "crates/reddwarf-storage" }
+reddwarf-versioning = { path = "crates/reddwarf-versioning" }
+reddwarf-apiserver = { path = "crates/reddwarf-apiserver" }
+reddwarf-scheduler = { path = "crates/reddwarf-scheduler" }
+
+# Kubernetes types
+k8s-openapi = { version = "0.23", features = ["v1_31"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# Error handling
+thiserror = "2.0"
+miette = { version = "7.0", features = ["fancy"] }
+anyhow = "1.0"
+
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+
+# Web framework
+axum = { version = "0.8", features = ["ws", "macros"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "compression-gzip", "trace"] }
+hyper = { version = "1.0", features = ["full"] }
+
+# Storage
+redb = "2.1"
+
+# Versioning
+jj-lib = "0.23"
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
+bytes = "1.0"
+
+# Logging and tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# TLS
+rcgen = "0.13"
+rustls = "0.23"
+rustls-pemfile = "2.0"
+
+# Testing
+tempfile = "3.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

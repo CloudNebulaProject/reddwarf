@@ -1,0 +1,25 @@
+[package]
+name = "reddwarf"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "reddwarf"
+path = "src/main.rs"
+
+[dependencies]
+reddwarf-core = { workspace = true }
+reddwarf-storage = { workspace = true }
+reddwarf-versioning = { workspace = true }
+reddwarf-apiserver = { workspace = true }
+reddwarf-scheduler = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+miette = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rcgen = { workspace = true }
