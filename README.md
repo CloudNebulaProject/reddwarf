@@ -4,7 +4,7 @@ A pure Rust implementation of a Kubernetes control plane with DAG-based resource
 
 ## Project Status
 
-**Current Phase**: Phase 3 Complete (Versioning Layer) ✅
+**Current Phase**: Phase 4 Complete (API Server) ✅
 
 ### Completed Phases
 
@@ -32,7 +32,17 @@ A pure Rust implementation of a Kubernetes control plane with DAG-based resource
 - ✅ Common ancestor finding
 - ✅ 7 tests passing
 
-### Total: 25 tests passing ✅
+#### Phase 4: API Server ✅
+- ✅ Axum-based REST API server
+- ✅ HTTP verb handlers (GET, POST, PUT, PATCH, DELETE)
+- ✅ Pod, Node, Service, Namespace endpoints
+- ✅ LIST operations with prefix filtering
+- ✅ Resource validation
+- ✅ Kubernetes-compatible error responses
+- ✅ Health check endpoints (/healthz, /livez, /readyz)
+- ✅ 7 tests passing
+
+### Total: 32 tests passing ✅
 
 ## Architecture
 
@@ -42,7 +52,7 @@ reddwarf/
 │   ├── reddwarf-core/          # ✅ Core K8s types & traits
 │   ├── reddwarf-storage/       # ✅ redb storage backend
 │   ├── reddwarf-versioning/    # ✅ DAG-based versioning
-│   ├── reddwarf-apiserver/     # 🔄 API server (pending)
+│   ├── reddwarf-apiserver/     # ✅ Axum REST API server
 │   ├── reddwarf-scheduler/     # 🔄 Pod scheduler (pending)
 │   └── reddwarf/               # 🔄 Main binary (pending)
 └── tests/                      # 🔄 Integration tests (pending)
@@ -65,13 +75,6 @@ cargo build --release
 ```
 
 ## Next Phases
-
-### Phase 4: API Server (Week 4-5)
-- Implement Axum-based REST API
-- HTTP verb handlers (GET/POST/PUT/PATCH/DELETE)
-- LIST with filtering and pagination
-- WATCH mechanism for streaming updates
-- Resource validation
 
 ### Phase 5: Basic Scheduler (Week 6)
 - Pod scheduling to nodes
