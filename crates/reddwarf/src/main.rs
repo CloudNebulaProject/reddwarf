@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
-use reddwarf_apiserver::{ApiServer, AppState, Config as ApiConfig};
+use reddwarf_apiserver::{ApiError, ApiServer, AppState, Config as ApiConfig};
+use reddwarf_core::Namespace;
 use reddwarf_runtime::{
     ApiClient, EtherstubConfig, MockRuntime, NetworkMode, NodeAgent, NodeAgentConfig,
     PodController, PodControllerConfig, ZoneBrand,
@@ -9,6 +10,7 @@ use reddwarf_scheduler::Scheduler;
 use reddwarf_storage::RedbBackend;
 use reddwarf_versioning::VersionStore;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 #[derive(Parser)]
@@ -79,6 +81,8 @@ async fn run_serve(bind: &str, data_dir: &str) -> miette::Result<()> {
 
     let state = create_app_state(data_dir)?;
 
+    bootstrap_default_namespace(&state).await?;
+
     let config = ApiConfig {
         listen_addr: bind
             .parse()
@@ -106,6 +110,8 @@ async fn run_agent(
 
     let state = create_app_state(data_dir)?;
 
+    bootstrap_default_namespace(&state).await?;
+
     let listen_addr: std::net::SocketAddr = bind
         .parse()
         .map_err(|e| miette::miette!("Invalid bind address '{}': {}", bind, e))?;
@@ -113,12 +119,22 @@ async fn run_agent(
     // Determine the API URL for internal components to connect to
     let api_url = format!("http://127.0.0.1:{}", listen_addr.port());
 
+    let token = CancellationToken::new();
+
     // 1. Spawn API server
     let api_config = ApiConfig { listen_addr };
     let api_server = ApiServer::new(api_config, state.clone());
+    let api_token = token.clone();
     let api_handle = tokio::spawn(async move {
-        if let Err(e) = api_server.run().await {
-            error!("API server error: {}", e);
+        tokio::select! {
+            result = api_server.run() => {
+                if let Err(e) = result {
+                    error!("API server error: {}", e);
+                }
+            }
+            _ = api_token.cancelled() => {
+                info!("API server shutting down");
+            }
         }
     });
 
@@ -126,9 +142,15 @@ async fn run_agent(
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // 2. Spawn scheduler
-    let scheduler = Scheduler::new(state.storage.clone(), SchedulerConfig::default());
+    let scheduler = Scheduler::new(
+        state.storage.clone(),
+        state.version_store.clone(),
+        state.event_tx.clone(),
+        SchedulerConfig::default(),
+    );
+    let scheduler_token = token.clone();
     let scheduler_handle = tokio::spawn(async move {
-        if let Err(e) = scheduler.run().await {
+        if let Err(e) = scheduler.run(scheduler_token).await {
             error!("Scheduler error: {}", e);
         }
     });
@@ -152,9 +174,15 @@ async fn run_agent(
         }),
     };
 
-    let controller = PodController::new(runtime, api_client.clone(), controller_config);
+    let controller = PodController::new(
+        runtime,
+        api_client.clone(),
+        state.event_tx.clone(),
+        controller_config,
+    );
+    let controller_token = token.clone();
     let controller_handle = tokio::spawn(async move {
-        if let Err(e) = controller.run().await {
+        if let Err(e) = controller.run(controller_token).await {
             error!("Pod controller error: {}", e);
         }
     });
@@ -162,8 +190,9 @@ async fn run_agent(
     // 5. Spawn node agent
     let node_agent_config = NodeAgentConfig::new(node_name.to_string(), api_url);
     let node_agent = NodeAgent::new(api_client, node_agent_config);
+    let agent_token = token.clone();
     let node_agent_handle = tokio::spawn(async move {
-        if let Err(e) = node_agent.run().await {
+        if let Err(e) = node_agent.run(agent_token).await {
             error!("Node agent error: {}", e);
         }
     });
@@ -178,14 +207,45 @@ async fn run_agent(
         .await
         .map_err(|e| miette::miette!("Failed to listen for ctrl-c: {}", e))?;
 
-    info!("Shutting down...");
+    info!("Shutting down gracefully...");
+    token.cancel();
 
-    // Abort all tasks
-    api_handle.abort();
-    scheduler_handle.abort();
-    controller_handle.abort();
-    node_agent_handle.abort();
+    // Wait for all tasks to finish with a timeout
+    let shutdown_timeout = std::time::Duration::from_secs(5);
+    let _ = tokio::time::timeout(shutdown_timeout, async {
+        let _ = tokio::join!(
+            api_handle,
+            scheduler_handle,
+            controller_handle,
+            node_agent_handle,
+        );
+    })
+    .await;
 
+    info!("Shutdown complete");
+
+    Ok(())
+}
+
+/// Bootstrap the "default" namespace if it doesn't already exist
+async fn bootstrap_default_namespace(state: &AppState) -> miette::Result<()> {
+    use reddwarf_apiserver::handlers::common::create_resource;
+
+    let mut ns = Namespace::default();
+    ns.metadata.name = Some("default".to_string());
+
+    match create_resource(state, ns).await {
+        Ok(_) => info!("Created default namespace"),
+        Err(ApiError::AlreadyExists(_)) => {
+            // Already exists — fine
+        }
+        Err(e) => {
+            return Err(miette::miette!(
+                "Failed to bootstrap default namespace: {:?}",
+                e
+            ))
+        }
+    }
     Ok(())
 }
 

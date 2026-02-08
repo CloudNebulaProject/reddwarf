@@ -1,9 +1,12 @@
 use crate::api_client::ApiClient;
 use crate::error::{Result, RuntimeError};
 use k8s_openapi::api::core::v1::{Node, NodeAddress, NodeCondition, NodeStatus};
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 /// Configuration for the node agent
@@ -65,7 +68,7 @@ impl NodeAgent {
     }
 
     /// Run the heartbeat loop
-    pub async fn run(&self) -> Result<()> {
+    pub async fn run(&self, token: CancellationToken) -> Result<()> {
         // Register first
         self.register().await?;
 
@@ -75,10 +78,16 @@ impl NodeAgent {
         );
 
         loop {
-            tokio::time::sleep(self.config.heartbeat_interval).await;
-
-            if let Err(e) = self.heartbeat().await {
-                warn!("Heartbeat failed: {} — will retry", e);
+            tokio::select! {
+                _ = token.cancelled() => {
+                    info!("Node agent shutting down");
+                    return Ok(());
+                }
+                _ = tokio::time::sleep(self.config.heartbeat_interval) => {
+                    if let Err(e) = self.heartbeat().await {
+                        warn!("Heartbeat failed: {} — will retry", e);
+                    }
+                }
             }
         }
     }
@@ -98,6 +107,22 @@ impl NodeAgent {
     /// Build the Node resource with current status
     fn build_node(&self) -> Node {
         let hostname = self.config.node_name.clone();
+
+        let cpu_count = std::thread::available_parallelism()
+            .map(|n| n.get().to_string())
+            .unwrap_or_else(|_| "1".to_string());
+
+        let allocatable = BTreeMap::from([
+            ("cpu".to_string(), Quantity(cpu_count.clone())),
+            ("memory".to_string(), Quantity("8Gi".to_string())),
+            ("pods".to_string(), Quantity("110".to_string())),
+        ]);
+
+        let capacity = BTreeMap::from([
+            ("cpu".to_string(), Quantity(cpu_count)),
+            ("memory".to_string(), Quantity("8Gi".to_string())),
+            ("pods".to_string(), Quantity("110".to_string())),
+        ]);
 
         Node {
             metadata: ObjectMeta {
@@ -132,6 +157,8 @@ impl NodeAgent {
                     type_: "Hostname".to_string(),
                     address: hostname,
                 }]),
+                allocatable: Some(allocatable),
+                capacity: Some(capacity),
                 ..Default::default()
             }),
             ..Default::default()
@@ -167,5 +194,37 @@ mod tests {
         assert_eq!(conditions[0].type_, "Ready");
         assert_eq!(conditions[0].status, "True");
         assert!(conditions[0].last_heartbeat_time.is_some());
+    }
+
+    #[test]
+    fn test_build_node_has_allocatable_resources() {
+        let api_client = Arc::new(ApiClient::new("http://127.0.0.1:6443"));
+        let config =
+            NodeAgentConfig::new("test-node".to_string(), "http://127.0.0.1:6443".to_string());
+        let agent = NodeAgent::new(api_client, config);
+
+        let node = agent.build_node();
+        let status = node.status.unwrap();
+
+        // Check allocatable
+        let alloc = status.allocatable.unwrap();
+        assert!(alloc.contains_key("cpu"));
+        assert!(alloc.contains_key("memory"));
+        assert!(alloc.contains_key("pods"));
+        assert_eq!(alloc["memory"].0, "8Gi");
+        assert_eq!(alloc["pods"].0, "110");
+
+        // CPU should match available parallelism
+        let expected_cpu = std::thread::available_parallelism()
+            .map(|n| n.get().to_string())
+            .unwrap_or_else(|_| "1".to_string());
+        assert_eq!(alloc["cpu"].0, expected_cpu);
+
+        // Check capacity
+        let cap = status.capacity.unwrap();
+        assert!(cap.contains_key("cpu"));
+        assert!(cap.contains_key("memory"));
+        assert!(cap.contains_key("pods"));
+        assert_eq!(cap["cpu"].0, expected_cpu);
     }
 }

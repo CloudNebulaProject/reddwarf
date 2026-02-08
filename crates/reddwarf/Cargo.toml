@@ -19,6 +19,7 @@ reddwarf-apiserver = { workspace = true }
 reddwarf-scheduler = { workspace = true }
 reddwarf-runtime = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 clap = { workspace = true }
 miette = { workspace = true }
 tracing = { workspace = true }

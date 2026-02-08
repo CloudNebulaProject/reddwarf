@@ -2,11 +2,14 @@ use crate::filter::{default_filters, FilterPredicate};
 use crate::score::{calculate_weighted_score, default_scores, ScoreFunction};
 use crate::types::SchedulingContext;
 use crate::{Result, SchedulerError};
-use reddwarf_core::{Node, Pod};
+use reddwarf_core::{Node, Pod, ResourceEvent};
 use reddwarf_storage::{KVStore, KeyEncoder, RedbBackend};
+use reddwarf_versioning::{Change, CommitBuilder, VersionStore};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::broadcast;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 /// Configuration for the scheduler
@@ -27,6 +30,8 @@ impl Default for SchedulerConfig {
 /// Pod scheduler
 pub struct Scheduler {
     storage: Arc<RedbBackend>,
+    version_store: Arc<VersionStore>,
+    event_tx: broadcast::Sender<ResourceEvent>,
     config: SchedulerConfig,
     filters: Vec<Box<dyn FilterPredicate>>,
     scorers: Vec<Box<dyn ScoreFunction>>,
@@ -34,9 +39,16 @@ pub struct Scheduler {
 
 impl Scheduler {
     /// Create a new scheduler
-    pub fn new(storage: Arc<RedbBackend>, config: SchedulerConfig) -> Self {
+    pub fn new(
+        storage: Arc<RedbBackend>,
+        version_store: Arc<VersionStore>,
+        event_tx: broadcast::Sender<ResourceEvent>,
+        config: SchedulerConfig,
+    ) -> Self {
         Self {
             storage,
+            version_store,
+            event_tx,
             config,
             filters: default_filters(),
             scorers: default_scores(),
@@ -44,15 +56,21 @@ impl Scheduler {
     }
 
     /// Run the scheduler loop
-    pub async fn run(&self) -> Result<()> {
+    pub async fn run(&self, token: CancellationToken) -> Result<()> {
         info!("Starting scheduler");
 
         loop {
-            if let Err(e) = self.schedule_cycle().await {
-                error!("Scheduling cycle failed: {}", e);
+            tokio::select! {
+                _ = token.cancelled() => {
+                    info!("Scheduler shutting down");
+                    return Ok(());
+                }
+                _ = sleep(self.config.schedule_interval) => {
+                    if let Err(e) = self.schedule_cycle().await {
+                        error!("Scheduling cycle failed: {}", e);
+                    }
+                }
             }
-
-            sleep(self.config.schedule_interval).await;
         }
     }
 
@@ -240,20 +258,38 @@ impl Scheduler {
         Ok(best_node)
     }
 
-    /// Bind a pod to a node (update spec.nodeName)
+    /// Bind a pod to a node (update spec.nodeName) with versioning and event publishing
     async fn bind_pod(&self, pod: &mut Pod, node_name: &str) -> Result<()> {
         let pod_name = pod
             .metadata
             .name
             .as_ref()
-            .ok_or_else(|| SchedulerError::internal_error("Pod has no name"))?;
+            .ok_or_else(|| SchedulerError::internal_error("Pod has no name"))?
+            .clone();
         let namespace = pod
             .metadata
             .namespace
             .as_ref()
-            .ok_or_else(|| SchedulerError::internal_error("Pod has no namespace"))?;
+            .ok_or_else(|| SchedulerError::internal_error("Pod has no namespace"))?
+            .clone();
 
         info!("Binding pod {} to node {}", pod_name, node_name);
+
+        let key = reddwarf_core::ResourceKey::new(
+            reddwarf_core::GroupVersionKind::from_api_version_kind("v1", "Pod"),
+            &namespace,
+            &pod_name,
+        );
+        let storage_key = KeyEncoder::encode_resource_key(&key);
+
+        // Read the current pod bytes for version diff
+        let prev_data = self
+            .storage
+            .as_ref()
+            .get(storage_key.as_bytes())?
+            .ok_or_else(|| {
+                SchedulerError::internal_error(format!("Pod not found in storage: {}", pod_name))
+            })?;
 
         // Update pod spec
         if let Some(spec) = &mut pod.spec {
@@ -262,21 +298,54 @@ impl Scheduler {
             return Err(SchedulerError::internal_error("Pod has no spec"));
         }
 
-        // Save updated pod
-        let key = reddwarf_core::ResourceKey::new(
-            reddwarf_core::GroupVersionKind::from_api_version_kind("v1", "Pod"),
-            namespace,
-            pod_name,
-        );
-
-        let storage_key = KeyEncoder::encode_resource_key(&key);
-        let data = serde_json::to_vec(&pod).map_err(|e| {
+        // Serialize new pod
+        let new_data = serde_json::to_vec(&pod).map_err(|e| {
             SchedulerError::internal_error(format!("Failed to serialize pod: {}", e))
         })?;
 
-        self.storage.as_ref().put(storage_key.as_bytes(), &data)?;
+        // Create a versioned commit
+        let change = Change::update(
+            storage_key.clone(),
+            String::from_utf8_lossy(&new_data).to_string(),
+            String::from_utf8_lossy(&prev_data).to_string(),
+        );
 
-        info!("Successfully bound pod {} to node {}", pod_name, node_name);
+        let commit = self
+            .version_store
+            .create_commit(
+                CommitBuilder::new()
+                    .change(change)
+                    .message(format!("Bind pod {} to node {}", pod_name, node_name)),
+            )
+            .map_err(|e| {
+                SchedulerError::internal_error(format!("Failed to create commit: {}", e))
+            })?;
+
+        // Set resource version to commit ID
+        pod.metadata.resource_version = Some(commit.id().to_string());
+
+        // Re-serialize with updated resource version
+        let final_data = serde_json::to_vec(&pod).map_err(|e| {
+            SchedulerError::internal_error(format!("Failed to serialize pod: {}", e))
+        })?;
+
+        // Write to storage
+        self.storage
+            .as_ref()
+            .put(storage_key.as_bytes(), &final_data)?;
+
+        info!(
+            "Successfully bound pod {} to node {} at version {}",
+            pod_name,
+            node_name,
+            commit.id()
+        );
+
+        // Publish MODIFIED event (best-effort)
+        if let Ok(object) = serde_json::to_value(&*pod) {
+            let event = ResourceEvent::modified(key, object, commit.id().to_string());
+            let _ = self.event_tx.send(event);
+        }
 
         Ok(())
     }
@@ -285,9 +354,22 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reddwarf_core::WatchEventType;
     use reddwarf_storage::RedbBackend;
+    use reddwarf_versioning::VersionStore;
     use std::collections::BTreeMap;
     use tempfile::tempdir;
+
+    fn create_test_scheduler() -> (Scheduler, broadcast::Receiver<ResourceEvent>) {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.redb");
+        let storage = Arc::new(RedbBackend::new(&db_path).unwrap());
+        let version_store = Arc::new(VersionStore::new(storage.clone()).unwrap());
+        let (event_tx, event_rx) = broadcast::channel(64);
+        let scheduler =
+            Scheduler::new(storage, version_store, event_tx, SchedulerConfig::default());
+        (scheduler, event_rx)
+    }
 
     fn create_test_node(name: &str, cpu: &str, memory: &str) -> Node {
         let mut node = Node::default();
@@ -355,13 +437,25 @@ mod tests {
         pod
     }
 
+    /// Helper: store a pod in storage so bind_pod can read prev version
+    fn store_pod(scheduler: &Scheduler, pod: &Pod) {
+        let key = reddwarf_core::ResourceKey::new(
+            reddwarf_core::GroupVersionKind::from_api_version_kind("v1", "Pod"),
+            pod.metadata.namespace.as_deref().unwrap(),
+            pod.metadata.name.as_deref().unwrap(),
+        );
+        let storage_key = KeyEncoder::encode_resource_key(&key);
+        let data = serde_json::to_vec(pod).unwrap();
+        scheduler
+            .storage
+            .as_ref()
+            .put(storage_key.as_bytes(), &data)
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn test_schedule_pod_success() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test.redb");
-        let storage = Arc::new(RedbBackend::new(&db_path).unwrap());
-
-        let scheduler = Scheduler::new(storage.clone(), SchedulerConfig::default());
+        let (scheduler, _rx) = create_test_scheduler();
 
         // Create nodes
         let nodes = vec![
@@ -369,8 +463,9 @@ mod tests {
             create_test_node("node2", "2", "4Gi"),
         ];
 
-        // Create pod
+        // Create pod and store it so bind_pod can read the previous version
         let pod = create_test_pod("test-pod", "default", "1", "1Gi");
+        store_pod(&scheduler, &pod);
 
         // Schedule pod
         let result = scheduler.schedule_pod(pod, &nodes).await;
@@ -382,11 +477,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_schedule_pod_no_suitable_nodes() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test.redb");
-        let storage = Arc::new(RedbBackend::new(&db_path).unwrap());
-
-        let scheduler = Scheduler::new(storage, SchedulerConfig::default());
+        let (scheduler, _rx) = create_test_scheduler();
 
         // Create node with insufficient resources
         let nodes = vec![create_test_node("node1", "1", "1Gi")];
@@ -398,5 +489,37 @@ mod tests {
         let result = scheduler.schedule_pod(pod, &nodes).await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_bind_pod_publishes_modified_event() {
+        let (scheduler, mut rx) = create_test_scheduler();
+
+        let mut pod = create_test_pod("event-pod", "default", "1", "1Gi");
+        store_pod(&scheduler, &pod);
+
+        scheduler.bind_pod(&mut pod, "node1").await.unwrap();
+
+        let event = rx.try_recv().unwrap();
+        assert!(matches!(event.event_type, WatchEventType::Modified));
+        assert_eq!(event.resource_key.name, "event-pod");
+        assert_eq!(event.gvk.kind, "Pod");
+
+        // Verify the event object has the updated node name
+        let bound_pod: Pod = serde_json::from_value(event.object).unwrap();
+        assert_eq!(bound_pod.spec.unwrap().node_name, Some("node1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_bind_pod_sets_resource_version() {
+        let (scheduler, _rx) = create_test_scheduler();
+
+        let mut pod = create_test_pod("version-pod", "default", "1", "1Gi");
+        store_pod(&scheduler, &pod);
+
+        scheduler.bind_pod(&mut pod, "node1").await.unwrap();
+
+        assert!(pod.metadata.resource_version.is_some());
+        assert!(!pod.metadata.resource_version.as_ref().unwrap().is_empty());
     }
 }

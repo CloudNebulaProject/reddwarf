@@ -10,8 +10,10 @@ rust-version.workspace = true
 [dependencies]
 reddwarf-core = { workspace = true }
 reddwarf-storage = { workspace = true }
+reddwarf-versioning = { workspace = true }
 k8s-openapi = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 miette = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

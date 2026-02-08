@@ -43,6 +43,7 @@ anyhow = "1.0"
 # Async runtime
 tokio = { version = "1.40", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 futures-util = "0.3"
 async-trait = "0.1"
 

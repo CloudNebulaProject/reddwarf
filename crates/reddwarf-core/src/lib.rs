@@ -7,11 +7,13 @@
 //! - Serialization helpers
 
 pub mod error;
+pub mod events;
 pub mod resources;
 pub mod types;
 
 // Re-export commonly used types
 pub use error::{ReddwarfError, Result};
+pub use events::{ResourceEvent, WatchEventType};
 pub use resources::{is_valid_name, Resource, ResourceError};
 pub use types::{GroupVersionKind, ResourceKey, ResourceVersion};
 

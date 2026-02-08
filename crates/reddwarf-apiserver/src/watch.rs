@@ -3,20 +3,11 @@ use crate::AppState;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures_util::StreamExt;
 use reddwarf_core::GroupVersionKind;
+pub use reddwarf_core::WatchEventType;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::sync::Arc;
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
-
-/// Watch event type
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
-pub enum WatchEventType {
-    Added,
-    Modified,
-    Deleted,
-    Error,
-}
 
 /// Watch event
 #[derive(Debug, Clone, Serialize, Deserialize)]

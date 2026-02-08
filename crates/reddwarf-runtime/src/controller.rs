@@ -3,7 +3,10 @@ use crate::error::{Result, RuntimeError};
 use crate::traits::ZoneRuntime;
 use crate::types::*;
 use k8s_openapi::api::core::v1::{Pod, PodCondition, PodStatus};
+use reddwarf_core::{ResourceEvent, WatchEventType};
 use std::sync::Arc;
+use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 /// Configuration for the pod controller
@@ -27,6 +30,7 @@ pub struct PodControllerConfig {
 pub struct PodController {
     runtime: Arc<dyn ZoneRuntime>,
     api_client: Arc<ApiClient>,
+    event_tx: broadcast::Sender<ResourceEvent>,
     config: PodControllerConfig,
 }
 
@@ -34,33 +38,89 @@ impl PodController {
     pub fn new(
         runtime: Arc<dyn ZoneRuntime>,
         api_client: Arc<ApiClient>,
+        event_tx: broadcast::Sender<ResourceEvent>,
         config: PodControllerConfig,
     ) -> Self {
         Self {
             runtime,
             api_client,
+            event_tx,
             config,
         }
     }
 
-    /// Run the controller — polls for unscheduled-to-this-node pods in a loop.
+    /// Run the controller — reacts to pod events from the in-process event bus.
     ///
-    /// In a real implementation, this would use SSE watch. For now, we receive
-    /// events via the in-process event bus by subscribing to the broadcast channel.
-    /// Since the controller runs in the same process as the API server, we use
-    /// a simpler polling approach over the HTTP API.
-    pub async fn run(&self) -> Result<()> {
+    /// On startup, performs a full reconcile to catch up on any pods that were
+    /// scheduled while the controller was down. Then switches to event-driven mode.
+    pub async fn run(&self, token: CancellationToken) -> Result<()> {
         info!(
             "Starting pod controller for node '{}'",
             self.config.node_name
         );
 
-        // Poll loop — watches for pods via HTTP list
+        // Initial full sync
+        if let Err(e) = self.reconcile_all().await {
+            error!("Initial reconcile failed: {}", e);
+        }
+
+        let mut rx = self.event_tx.subscribe();
+
         loop {
-            if let Err(e) = self.reconcile_all().await {
-                error!("Pod controller reconcile cycle failed: {}", e);
+            tokio::select! {
+                _ = token.cancelled() => {
+                    info!("Pod controller shutting down");
+                    return Ok(());
+                }
+                result = rx.recv() => {
+                    match result {
+                        Ok(event) => {
+                            if event.gvk.kind != "Pod" {
+                                continue;
+                            }
+                            match event.event_type {
+                                WatchEventType::Added | WatchEventType::Modified => {
+                                    match serde_json::from_value::<Pod>(event.object) {
+                                        Ok(pod) => {
+                                            if let Err(e) = self.reconcile(&pod).await {
+                                                let name = pod.metadata.name.as_deref().unwrap_or("<unknown>");
+                                                error!("Failed to reconcile pod {}: {}", name, e);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("Failed to parse pod from event: {}", e);
+                                        }
+                                    }
+                                }
+                                WatchEventType::Deleted => {
+                                    match serde_json::from_value::<Pod>(event.object) {
+                                        Ok(pod) => {
+                                            if let Err(e) = self.handle_delete(&pod).await {
+                                                let name = pod.metadata.name.as_deref().unwrap_or("<unknown>");
+                                                error!("Failed to handle pod deletion {}: {}", name, e);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("Failed to parse pod from delete event: {}", e);
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("Missed {} events, doing full resync", n);
+                            if let Err(e) = self.reconcile_all().await {
+                                error!("Resync after lag failed: {}", e);
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            info!("Event bus closed, stopping pod controller");
+                            return Ok(());
+                        }
+                    }
+                }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
     }
 
