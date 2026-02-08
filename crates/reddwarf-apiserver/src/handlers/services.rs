@@ -3,8 +3,9 @@ use crate::handlers::common::{
 };
 use crate::response::{status_deleted, ApiResponse};
 use crate::validation::validate_resource;
+use crate::watch::{watch_resource_stream, WatchParams};
 use crate::{AppState, Result};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use reddwarf_core::{GroupVersionKind, ResourceKey, Service};
@@ -29,7 +30,13 @@ pub async fn get_service(
 pub async fn list_services(
     State(state): State<Arc<AppState>>,
     Path(namespace): Path<String>,
+    Query(params): Query<WatchParams>,
 ) -> Result<Response> {
+    if params.is_watch() {
+        let gvk = GroupVersionKind::from_api_version_kind("v1", "Service");
+        return Ok(watch_resource_stream(&state, gvk, Some(namespace)).into_response());
+    }
+
     let prefix = KeyEncoder::encode_prefix("v1", "Service", Some(&namespace));
     let services: Vec<Service> = list_resources(&state, &prefix).await?;
 

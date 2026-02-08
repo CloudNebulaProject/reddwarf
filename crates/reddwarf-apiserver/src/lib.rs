@@ -8,6 +8,7 @@
 //! - WATCH mechanism for streaming updates
 
 pub mod error;
+pub mod event_bus;
 pub mod handlers;
 pub mod response;
 pub mod server;
@@ -17,5 +18,6 @@ pub mod watch;
 
 // Re-export commonly used types
 pub use error::{ApiError, Result};
+pub use event_bus::ResourceEvent;
 pub use server::{ApiServer, Config};
 pub use state::AppState;

@@ -1,3 +1,4 @@
+use crate::event_bus::ResourceEvent;
 use crate::{ApiError, AppState, Result};
 use reddwarf_core::{Resource, ResourceKey};
 use reddwarf_storage::{KVStore, KeyEncoder};
@@ -66,6 +67,13 @@ pub async fn create_resource<T: Resource>(state: &AppState, mut resource: T) -> 
     state.storage.as_ref().put(storage_key.as_bytes(), &data)?;
 
     info!("Created resource: {} with version {}", key, commit.id());
+
+    // Publish ADDED event (best-effort)
+    if let Ok(object) = serde_json::to_value(&resource) {
+        let event = ResourceEvent::added(key, object, commit.id().to_string());
+        let _ = state.event_tx.send(event);
+    }
+
     Ok(resource)
 }
 
@@ -115,6 +123,13 @@ pub async fn update_resource<T: Resource>(state: &AppState, mut resource: T) -> 
         .put(storage_key.as_bytes(), &new_data)?;
 
     info!("Updated resource: {} with version {}", key, commit.id());
+
+    // Publish MODIFIED event (best-effort)
+    if let Ok(object) = serde_json::to_value(&resource) {
+        let event = ResourceEvent::modified(key, object, commit.id().to_string());
+        let _ = state.event_tx.send(event);
+    }
+
     Ok(resource)
 }
 
@@ -150,6 +165,13 @@ pub async fn delete_resource(state: &AppState, key: &ResourceKey) -> Result<()> 
     state.storage.as_ref().delete(storage_key.as_bytes())?;
 
     info!("Deleted resource: {} at version {}", key, commit.id());
+
+    // Publish DELETED event with last-known state (best-effort)
+    if let Ok(object) = serde_json::from_slice::<serde_json::Value>(&prev_data) {
+        let event = ResourceEvent::deleted(key.clone(), object, commit.id().to_string());
+        let _ = state.event_tx.send(event);
+    }
+
     Ok(())
 }
 

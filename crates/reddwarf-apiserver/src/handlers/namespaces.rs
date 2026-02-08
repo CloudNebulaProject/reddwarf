@@ -3,8 +3,9 @@ use crate::handlers::common::{
 };
 use crate::response::{status_deleted, ApiResponse};
 use crate::validation::validate_resource;
+use crate::watch::{watch_resource_stream, WatchParams};
 use crate::{AppState, Result};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use reddwarf_core::{GroupVersionKind, Namespace, ResourceKey};
@@ -26,7 +27,15 @@ pub async fn get_namespace(
 }
 
 /// GET /api/v1/namespaces
-pub async fn list_namespaces(State(state): State<Arc<AppState>>) -> Result<Response> {
+pub async fn list_namespaces(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<WatchParams>,
+) -> Result<Response> {
+    if params.is_watch() {
+        let gvk = GroupVersionKind::from_api_version_kind("v1", "Namespace");
+        return Ok(watch_resource_stream(&state, gvk, None).into_response());
+    }
+
     let prefix = KeyEncoder::encode_prefix("v1", "Namespace", None);
     let namespaces: Vec<Namespace> = list_resources(&state, &prefix).await?;
 

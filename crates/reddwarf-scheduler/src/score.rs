@@ -87,7 +87,7 @@ impl ScoreFunction for LeastAllocated {
         // Score is inverse of average utilization
         // Lower utilization = higher score (prefer less loaded nodes)
         let avg_utilization = (cpu_utilization + memory_utilization) / 2.0;
-        let score = (100.0 - avg_utilization).max(0.0).min(100.0) as i32;
+        let score = (100.0 - avg_utilization).clamp(0.0, 100.0) as i32;
 
         debug!(
             "Node {} score: {} (CPU util: {:.1}%, Memory util: {:.1}%)",
@@ -159,7 +159,7 @@ impl ScoreFunction for BalancedAllocation {
 
         // Prefer balanced resource usage (CPU and memory usage should be similar)
         let variance = (cpu_fraction - memory_fraction).abs();
-        let score = ((1.0 - variance) * 100.0).max(0.0).min(100.0) as i32;
+        let score = ((1.0 - variance) * 100.0).clamp(0.0, 100.0) as i32;
 
         debug!(
             "Node {} balanced allocation score: {} (variance: {:.3})",
