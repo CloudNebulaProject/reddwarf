@@ -175,6 +175,84 @@ pub async fn delete_resource(state: &AppState, key: &ResourceKey) -> Result<()> 
     Ok(())
 }
 
+/// Update only the status subresource of a resource
+///
+/// This reads the existing resource, replaces only `.status` from the incoming
+/// resource, preserving `.spec` and `.metadata` (except bumping `resourceVersion`).
+/// Publishes a MODIFIED event on the event bus.
+pub async fn update_status<T: Resource>(state: &AppState, resource: T) -> Result<T> {
+    let key = resource
+        .resource_key()
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+    info!("Updating status for resource: {}", key);
+
+    let storage_key = KeyEncoder::encode_resource_key(&key);
+
+    // Read existing resource from storage
+    let existing_data = state
+        .storage
+        .as_ref()
+        .get(storage_key.as_bytes())?
+        .ok_or_else(|| ApiError::NotFound(format!("Resource not found: {}", key)))?;
+
+    // Parse existing and incoming as JSON values
+    let mut existing_json: serde_json::Value = serde_json::from_slice(&existing_data)?;
+    let incoming_json = serde_json::to_value(&resource)?;
+
+    // Replace only the status field from the incoming resource
+    if let Some(status) = incoming_json.get("status") {
+        existing_json["status"] = status.clone();
+    }
+
+    // Serialize the merged resource
+    let merged_data = serde_json::to_vec(&existing_json)?;
+
+    // Create commit
+    let change = Change::update(
+        storage_key.clone(),
+        String::from_utf8_lossy(&merged_data).to_string(),
+        String::from_utf8_lossy(&existing_data).to_string(),
+    );
+
+    let commit = state
+        .version_store
+        .create_commit(
+            CommitBuilder::new()
+                .change(change)
+                .message(format!("Update status {}", key)),
+        )
+        .map_err(ApiError::from)?;
+
+    // Set resource version in the merged JSON
+    existing_json["metadata"]["resourceVersion"] =
+        serde_json::Value::String(commit.id().to_string());
+
+    // Serialize again with updated resource version
+    let final_data = serde_json::to_vec(&existing_json)?;
+
+    // Store in storage
+    state
+        .storage
+        .as_ref()
+        .put(storage_key.as_bytes(), &final_data)?;
+
+    info!(
+        "Updated status for resource: {} with version {}",
+        key,
+        commit.id()
+    );
+
+    // Deserialize back to T
+    let updated: T = serde_json::from_value(existing_json.clone())?;
+
+    // Publish MODIFIED event (best-effort)
+    let event = ResourceEvent::modified(key, existing_json, commit.id().to_string());
+    let _ = state.event_tx.send(event);
+
+    Ok(updated)
+}
+
 /// List resources with optional filtering
 pub async fn list_resources<T: Resource>(state: &AppState, prefix: &str) -> Result<Vec<T>> {
     debug!("Listing resources with prefix: {}", prefix);

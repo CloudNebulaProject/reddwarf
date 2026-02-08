@@ -1,5 +1,6 @@
 use crate::handlers::common::{
-    create_resource, delete_resource, get_resource, list_resources, update_resource, ListResponse,
+    create_resource, delete_resource, get_resource, list_resources, update_resource, update_status,
+    ListResponse,
 };
 use crate::response::{status_deleted, ApiResponse};
 use crate::validation::validate_resource;
@@ -74,6 +75,21 @@ pub async fn replace_node(
     Ok(ApiResponse::ok(updated).into_response())
 }
 
+/// PUT /api/v1/nodes/{name}/status
+pub async fn update_node_status(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(mut node): Json<Node>,
+) -> Result<Response> {
+    info!("Updating node status: {}", name);
+
+    node.metadata.name = Some(name);
+
+    let updated = update_status(&state, node).await?;
+
+    Ok(ApiResponse::ok(updated).into_response())
+}
+
 /// DELETE /api/v1/nodes/{name}
 pub async fn delete_node(
     State(state): State<Arc<AppState>>,
@@ -87,4 +103,63 @@ pub async fn delete_node(
     delete_resource(&state, &key).await?;
 
     Ok(status_deleted(&name, "Node"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reddwarf_core::k8s_openapi::api::core::v1::{NodeCondition, NodeStatus};
+    use reddwarf_core::Resource;
+    use reddwarf_storage::RedbBackend;
+    use reddwarf_versioning::VersionStore;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    async fn setup_state() -> Arc<AppState> {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.redb");
+        let storage = Arc::new(RedbBackend::new(&db_path).unwrap());
+        let version_store = Arc::new(VersionStore::new(storage.clone()).unwrap());
+
+        Arc::new(AppState::new(storage, version_store))
+    }
+
+    #[tokio::test]
+    async fn test_update_node_status_updates_conditions() {
+        let state = setup_state().await;
+
+        // Create a node
+        let mut node = Node::default();
+        node.metadata.name = Some("test-node".to_string());
+        let created = create_resource(&*state, node).await.unwrap();
+
+        // Update status with conditions
+        let mut status_node = created.clone();
+        status_node.status = Some(NodeStatus {
+            conditions: Some(vec![NodeCondition {
+                type_: "Ready".to_string(),
+                status: "True".to_string(),
+                reason: Some("KubeletReady".to_string()),
+                message: Some("node is healthy".to_string()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+
+        let updated = update_status(&*state, status_node).await.unwrap();
+
+        let conditions = updated
+            .status
+            .as_ref()
+            .unwrap()
+            .conditions
+            .as_ref()
+            .unwrap();
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(conditions[0].type_, "Ready");
+        assert_eq!(conditions[0].status, "True");
+
+        // Resource version should be bumped
+        assert_ne!(updated.resource_version(), created.resource_version());
+    }
 }

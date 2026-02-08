@@ -9,7 +9,9 @@ rust-version.workspace = true
 
 [dependencies]
 reddwarf-core = { workspace = true }
+k8s-openapi = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 miette = { workspace = true }
@@ -17,6 +19,9 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 async-trait = { workspace = true }
+reqwest = { workspace = true }
+chrono = { workspace = true }
+futures-util = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

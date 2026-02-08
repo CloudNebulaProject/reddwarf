@@ -54,12 +54,20 @@ impl ApiServer {
                     .patch(patch_pod)
                     .delete(delete_pod),
             )
+            .route(
+                "/api/v1/namespaces/{namespace}/pods/{name}/status",
+                axum::routing::put(update_pod_status),
+            )
             .route("/api/v1/pods", get(list_pods))
             // Nodes
             .route("/api/v1/nodes", get(list_nodes).post(create_node))
             .route(
                 "/api/v1/nodes/{name}",
                 get(get_node).put(replace_node).delete(delete_node),
+            )
+            .route(
+                "/api/v1/nodes/{name}/status",
+                axum::routing::put(update_node_status),
             )
             // Services
             .route(
