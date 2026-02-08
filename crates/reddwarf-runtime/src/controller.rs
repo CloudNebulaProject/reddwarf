@@ -1,5 +1,6 @@
 use crate::api_client::ApiClient;
 use crate::error::{Result, RuntimeError};
+use crate::network::{vnic_name_for_pod, Ipam};
 use crate::traits::ZoneRuntime;
 use crate::types::*;
 use k8s_openapi::api::core::v1::{Pod, PodCondition, PodStatus};
@@ -22,8 +23,10 @@ pub struct PodControllerConfig {
     pub zfs_parent_dataset: String,
     /// Default zone brand
     pub default_brand: ZoneBrand,
-    /// Default network configuration
-    pub network: NetworkMode,
+    /// Name of the etherstub for pod networking
+    pub etherstub_name: String,
+    /// Pod CIDR (e.g., "10.88.0.0/16")
+    pub pod_cidr: String,
 }
 
 /// Pod controller that watches for Pod events and drives zone lifecycle
@@ -32,6 +35,7 @@ pub struct PodController {
     api_client: Arc<ApiClient>,
     event_tx: broadcast::Sender<ResourceEvent>,
     config: PodControllerConfig,
+    ipam: Ipam,
 }
 
 impl PodController {
@@ -40,12 +44,14 @@ impl PodController {
         api_client: Arc<ApiClient>,
         event_tx: broadcast::Sender<ResourceEvent>,
         config: PodControllerConfig,
+        ipam: Ipam,
     ) -> Self {
         Self {
             runtime,
             api_client,
             event_tx,
             config,
+            ipam,
         }
     }
 
@@ -205,7 +211,7 @@ impl PodController {
             "" | "Pending" => {
                 // Pod is assigned to us but has no phase — provision it
                 info!("Provisioning zone for pod {}/{}", namespace, pod_name);
-                let zone_config = pod_to_zone_config(pod, &self.config)?;
+                let zone_config = self.pod_to_zone_config(pod)?;
 
                 match self.runtime.provision(&zone_config).await {
                     Ok(()) => {
@@ -328,7 +334,7 @@ impl PodController {
         Ok(())
     }
 
-    /// Handle pod deletion — deprovision the zone
+    /// Handle pod deletion — deprovision the zone and release IP
     pub async fn handle_delete(&self, pod: &Pod) -> Result<()> {
         let pod_name = pod
             .metadata
@@ -348,7 +354,7 @@ impl PodController {
             }
         }
 
-        let zone_config = pod_to_zone_config(pod, &self.config)?;
+        let zone_config = self.pod_to_zone_config(pod)?;
         info!(
             "Deprovisioning zone for deleted pod {}/{}",
             namespace, pod_name
@@ -361,7 +367,94 @@ impl PodController {
             );
         }
 
+        // Release the IP allocation
+        if let Err(e) = self.ipam.release(namespace, pod_name) {
+            warn!(
+                "Failed to release IP for pod {}/{}: {}",
+                namespace, pod_name, e
+            );
+        }
+
         Ok(())
+    }
+
+    /// Convert a Pod spec to a ZoneConfig with per-pod VNIC and IP
+    fn pod_to_zone_config(&self, pod: &Pod) -> Result<ZoneConfig> {
+        let pod_name = pod
+            .metadata
+            .name
+            .as_deref()
+            .ok_or_else(|| RuntimeError::internal_error("Pod has no name"))?;
+        let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
+
+        let spec = pod
+            .spec
+            .as_ref()
+            .ok_or_else(|| RuntimeError::internal_error("Pod has no spec"))?;
+
+        let zone_name = pod_zone_name(namespace, pod_name);
+        let zonepath = format!("{}/{}", self.config.zonepath_prefix, zone_name);
+
+        // Allocate a unique VNIC name and IP for this pod
+        let vnic_name = vnic_name_for_pod(namespace, pod_name);
+        let allocation = self.ipam.allocate(namespace, pod_name)?;
+
+        let network = NetworkMode::Etherstub(EtherstubConfig {
+            etherstub_name: self.config.etherstub_name.clone(),
+            vnic_name,
+            ip_address: allocation.ip_address.to_string(),
+            gateway: allocation.gateway.to_string(),
+            prefix_len: allocation.prefix_len,
+        });
+
+        // Map containers to ContainerProcess entries
+        let processes: Vec<ContainerProcess> = spec
+            .containers
+            .iter()
+            .map(|c| {
+                let command = c
+                    .command
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .chain(c.args.clone().unwrap_or_default())
+                    .collect::<Vec<_>>();
+
+                let env = c
+                    .env
+                    .as_ref()
+                    .map(|envs| {
+                        envs.iter()
+                            .filter_map(|e| e.value.as_ref().map(|v| (e.name.clone(), v.clone())))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+
+                ContainerProcess {
+                    name: c.name.clone(),
+                    command,
+                    working_dir: c.working_dir.clone(),
+                    env,
+                }
+            })
+            .collect();
+
+        Ok(ZoneConfig {
+            zone_name,
+            brand: self.config.default_brand.clone(),
+            zonepath,
+            network,
+            zfs: ZfsConfig {
+                parent_dataset: self.config.zfs_parent_dataset.clone(),
+                clone_from: None,
+                quota: None,
+            },
+            lx_image_path: None,
+            processes,
+            cpu_cap: None,
+            memory_cap: None,
+            fs_mounts: vec![],
+        })
     }
 
     /// Extract IP address from zone config network
@@ -396,77 +489,38 @@ pub fn pod_zone_name(namespace: &str, pod_name: &str) -> String {
     }
 }
 
-/// Convert a Pod spec to a ZoneConfig for the runtime
-pub fn pod_to_zone_config(pod: &Pod, config: &PodControllerConfig) -> Result<ZoneConfig> {
-    let pod_name = pod
-        .metadata
-        .name
-        .as_deref()
-        .ok_or_else(|| RuntimeError::internal_error("Pod has no name"))?;
-    let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
-
-    let spec = pod
-        .spec
-        .as_ref()
-        .ok_or_else(|| RuntimeError::internal_error("Pod has no spec"))?;
-
-    let zone_name = pod_zone_name(namespace, pod_name);
-    let zonepath = format!("{}/{}", config.zonepath_prefix, zone_name);
-
-    // Map containers to ContainerProcess entries
-    let processes: Vec<ContainerProcess> = spec
-        .containers
-        .iter()
-        .map(|c| {
-            let command = c
-                .command
-                .clone()
-                .unwrap_or_default()
-                .into_iter()
-                .chain(c.args.clone().unwrap_or_default())
-                .collect::<Vec<_>>();
-
-            let env = c
-                .env
-                .as_ref()
-                .map(|envs| {
-                    envs.iter()
-                        .filter_map(|e| e.value.as_ref().map(|v| (e.name.clone(), v.clone())))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-
-            ContainerProcess {
-                name: c.name.clone(),
-                command,
-                working_dir: c.working_dir.clone(),
-                env,
-            }
-        })
-        .collect();
-
-    Ok(ZoneConfig {
-        zone_name,
-        brand: config.default_brand.clone(),
-        zonepath,
-        network: config.network.clone(),
-        zfs: ZfsConfig {
-            parent_dataset: config.zfs_parent_dataset.clone(),
-            clone_from: None,
-            quota: None,
-        },
-        lx_image_path: None,
-        processes,
-        cpu_cap: None,
-        memory_cap: None,
-        fs_mounts: vec![],
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::Ipam;
     use k8s_openapi::api::core::v1::{Container, PodSpec};
+    use reddwarf_storage::RedbBackend;
+    use std::net::Ipv4Addr;
+    use tempfile::tempdir;
+
+    fn make_test_controller() -> (PodController, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test-controller.redb");
+        let storage = Arc::new(RedbBackend::new(&db_path).unwrap());
+        let ipam = Ipam::new(storage, "10.88.0.0/16").unwrap();
+
+        let runtime = Arc::new(crate::mock::MockRuntime::new());
+        let api_client = Arc::new(ApiClient::new("http://127.0.0.1:6443"));
+        let (event_tx, _) = broadcast::channel(16);
+
+        let config = PodControllerConfig {
+            node_name: "node1".to_string(),
+            api_url: "http://127.0.0.1:6443".to_string(),
+            zonepath_prefix: "/zones".to_string(),
+            zfs_parent_dataset: "rpool/zones".to_string(),
+            default_brand: ZoneBrand::Reddwarf,
+            etherstub_name: "reddwarf0".to_string(),
+            pod_cidr: "10.88.0.0/16".to_string(),
+        };
+
+        let controller = PodController::new(runtime, api_client, event_tx, config, ipam);
+        (controller, dir)
+    }
 
     #[test]
     fn test_pod_zone_name_basic() {
@@ -491,6 +545,8 @@ mod tests {
 
     #[test]
     fn test_pod_to_zone_config_maps_containers() {
+        let (controller, _dir) = make_test_controller();
+
         let mut pod = Pod::default();
         pod.metadata.name = Some("test-pod".to_string());
         pod.metadata.namespace = Some("default".to_string());
@@ -511,21 +567,7 @@ mod tests {
             ..Default::default()
         });
 
-        let config = PodControllerConfig {
-            node_name: "node1".to_string(),
-            api_url: "http://127.0.0.1:6443".to_string(),
-            zonepath_prefix: "/zones".to_string(),
-            zfs_parent_dataset: "rpool/zones".to_string(),
-            default_brand: ZoneBrand::Reddwarf,
-            network: NetworkMode::Etherstub(EtherstubConfig {
-                etherstub_name: "reddwarf0".to_string(),
-                vnic_name: "vnic0".to_string(),
-                ip_address: "10.0.0.2".to_string(),
-                gateway: "10.0.0.1".to_string(),
-            }),
-        };
-
-        let zone_config = pod_to_zone_config(&pod, &config).unwrap();
+        let zone_config = controller.pod_to_zone_config(&pod).unwrap();
 
         assert_eq!(zone_config.zone_name, "reddwarf-default-test-pod");
         assert_eq!(zone_config.zonepath, "/zones/reddwarf-default-test-pod");
@@ -539,29 +581,74 @@ mod tests {
         assert_eq!(zone_config.processes[1].command, vec!["/bin/sh", "-c"]);
         assert_eq!(zone_config.brand, ZoneBrand::Reddwarf);
         assert_eq!(zone_config.zfs.parent_dataset, "rpool/zones");
+
+        // Verify per-pod networking
+        match &zone_config.network {
+            NetworkMode::Etherstub(cfg) => {
+                assert_eq!(cfg.etherstub_name, "reddwarf0");
+                assert_eq!(cfg.vnic_name, "vnic_default_test_pod");
+                assert_eq!(cfg.ip_address, Ipv4Addr::new(10, 88, 0, 2).to_string());
+                assert_eq!(cfg.gateway, Ipv4Addr::new(10, 88, 0, 1).to_string());
+                assert_eq!(cfg.prefix_len, 16);
+            }
+            _ => panic!("Expected Etherstub network mode"),
+        }
+    }
+
+    #[test]
+    fn test_pod_to_zone_config_unique_ips() {
+        let (controller, _dir) = make_test_controller();
+
+        let mut pod_a = Pod::default();
+        pod_a.metadata.name = Some("pod-a".to_string());
+        pod_a.metadata.namespace = Some("default".to_string());
+        pod_a.spec = Some(PodSpec {
+            containers: vec![Container {
+                name: "web".to_string(),
+                command: Some(vec!["/bin/sh".to_string()]),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let mut pod_b = Pod::default();
+        pod_b.metadata.name = Some("pod-b".to_string());
+        pod_b.metadata.namespace = Some("default".to_string());
+        pod_b.spec = Some(PodSpec {
+            containers: vec![Container {
+                name: "web".to_string(),
+                command: Some(vec!["/bin/sh".to_string()]),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let config_a = controller.pod_to_zone_config(&pod_a).unwrap();
+        let config_b = controller.pod_to_zone_config(&pod_b).unwrap();
+
+        let ip_a = match &config_a.network {
+            NetworkMode::Etherstub(cfg) => cfg.ip_address.clone(),
+            _ => panic!("Expected Etherstub"),
+        };
+        let ip_b = match &config_b.network {
+            NetworkMode::Etherstub(cfg) => cfg.ip_address.clone(),
+            _ => panic!("Expected Etherstub"),
+        };
+
+        assert_ne!(ip_a, ip_b, "Each pod should get a unique IP");
+        assert_eq!(ip_a, "10.88.0.2");
+        assert_eq!(ip_b, "10.88.0.3");
     }
 
     #[test]
     fn test_pod_to_zone_config_no_spec_returns_error() {
+        let (controller, _dir) = make_test_controller();
+
         let mut pod = Pod::default();
         pod.metadata.name = Some("test-pod".to_string());
         // No spec set
 
-        let config = PodControllerConfig {
-            node_name: "node1".to_string(),
-            api_url: "http://127.0.0.1:6443".to_string(),
-            zonepath_prefix: "/zones".to_string(),
-            zfs_parent_dataset: "rpool/zones".to_string(),
-            default_brand: ZoneBrand::Reddwarf,
-            network: NetworkMode::Etherstub(EtherstubConfig {
-                etherstub_name: "reddwarf0".to_string(),
-                vnic_name: "vnic0".to_string(),
-                ip_address: "10.0.0.2".to_string(),
-                gateway: "10.0.0.1".to_string(),
-            }),
-        };
-
-        let result = pod_to_zone_config(&pod, &config);
+        let result = controller.pod_to_zone_config(&pod);
         assert!(result.is_err());
     }
 }

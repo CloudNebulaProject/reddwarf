@@ -1,6 +1,8 @@
+pub mod ipam;
 pub mod types;
 
 pub use crate::types::{DirectNicConfig, EtherstubConfig, NetworkMode};
+pub use ipam::{CidrConfig, IpAllocation, Ipam};
 
 /// Generate a VNIC name from pod namespace and name
 pub fn vnic_name_for_pod(namespace: &str, pod_name: &str) -> String {

@@ -115,6 +115,22 @@ pub enum RuntimeError {
     #[diagnostic(transparent)]
     CoreError(#[from] reddwarf_core::ReddwarfError),
 
+    /// Storage error
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    StorageError(#[from] reddwarf_storage::StorageError),
+
+    /// IP address pool exhausted
+    #[error("IPAM pool exhausted: no free addresses in {cidr}")]
+    #[diagnostic(
+        code(reddwarf::runtime::ipam_pool_exhausted),
+        help("Expand the pod CIDR range or delete unused pods to free addresses")
+    )]
+    IpamPoolExhausted {
+        #[allow(unused)]
+        cidr: String,
+    },
+
     /// Internal error
     #[error("Internal runtime error: {message}")]
     #[diagnostic(

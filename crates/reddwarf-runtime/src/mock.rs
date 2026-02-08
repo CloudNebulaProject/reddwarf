@@ -312,6 +312,7 @@ mod tests {
                 vnic_name: format!("vnic_{}", name),
                 ip_address: "10.0.0.2".to_string(),
                 gateway: "10.0.0.1".to_string(),
+                prefix_len: 16,
             }),
             zfs: ZfsConfig {
                 parent_dataset: "rpool/zones".to_string(),

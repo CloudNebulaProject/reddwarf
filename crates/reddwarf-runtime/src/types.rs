@@ -104,6 +104,8 @@ pub struct EtherstubConfig {
     pub ip_address: String,
     /// Gateway address
     pub gateway: String,
+    /// CIDR prefix length (e.g., 16 for /16)
+    pub prefix_len: u8,
 }
 
 /// Direct NIC-based network configuration
@@ -117,6 +119,8 @@ pub struct DirectNicConfig {
     pub ip_address: String,
     /// Gateway address
     pub gateway: String,
+    /// CIDR prefix length (e.g., 16 for /16)
+    pub prefix_len: u8,
 }
 
 /// ZFS dataset configuration for zone storage

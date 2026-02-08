@@ -2,8 +2,8 @@ use clap::{Parser, Subcommand};
 use reddwarf_apiserver::{ApiError, ApiServer, AppState, Config as ApiConfig};
 use reddwarf_core::Namespace;
 use reddwarf_runtime::{
-    ApiClient, EtherstubConfig, MockRuntime, NetworkMode, NodeAgent, NodeAgentConfig,
-    PodController, PodControllerConfig, ZoneBrand,
+    ApiClient, Ipam, MockRuntime, NodeAgent, NodeAgentConfig, PodController, PodControllerConfig,
+    ZoneBrand,
 };
 use reddwarf_scheduler::scheduler::SchedulerConfig;
 use reddwarf_scheduler::Scheduler;
@@ -48,6 +48,12 @@ enum Commands {
         /// Parent ZFS dataset for zone storage
         #[arg(long, default_value = "rpool/zones")]
         zfs_parent: String,
+        /// Pod network CIDR for IPAM allocation
+        #[arg(long, default_value = "10.88.0.0/16")]
+        pod_cidr: String,
+        /// Etherstub name for pod networking
+        #[arg(long, default_value = "reddwarf0")]
+        etherstub_name: String,
     },
 }
 
@@ -71,7 +77,20 @@ async fn main() -> miette::Result<()> {
             data_dir,
             zonepath_prefix,
             zfs_parent,
-        } => run_agent(&node_name, &bind, &data_dir, &zonepath_prefix, &zfs_parent).await,
+            pod_cidr,
+            etherstub_name,
+        } => {
+            run_agent(
+                &node_name,
+                &bind,
+                &data_dir,
+                &zonepath_prefix,
+                &zfs_parent,
+                &pod_cidr,
+                &etherstub_name,
+            )
+            .await
+        }
     }
 }
 
@@ -105,6 +124,8 @@ async fn run_agent(
     data_dir: &str,
     zonepath_prefix: &str,
     zfs_parent: &str,
+    pod_cidr: &str,
+    etherstub_name: &str,
 ) -> miette::Result<()> {
     info!("Starting reddwarf agent for node '{}'", node_name);
 
@@ -158,7 +179,12 @@ async fn run_agent(
     // 3. Create runtime (MockRuntime on non-illumos, IllumosRuntime on illumos)
     let runtime: Arc<dyn reddwarf_runtime::ZoneRuntime> = create_runtime();
 
-    // 4. Spawn pod controller
+    // 4. Create IPAM for per-pod IP allocation
+    let ipam = Ipam::new(state.storage.clone(), pod_cidr).map_err(|e| {
+        miette::miette!("Failed to initialize IPAM with CIDR '{}': {}", pod_cidr, e)
+    })?;
+
+    // 5. Spawn pod controller
     let api_client = Arc::new(ApiClient::new(&api_url));
     let controller_config = PodControllerConfig {
         node_name: node_name.to_string(),
@@ -166,12 +192,8 @@ async fn run_agent(
         zonepath_prefix: zonepath_prefix.to_string(),
         zfs_parent_dataset: zfs_parent.to_string(),
         default_brand: ZoneBrand::Reddwarf,
-        network: NetworkMode::Etherstub(EtherstubConfig {
-            etherstub_name: "reddwarf0".to_string(),
-            vnic_name: "reddwarf_vnic0".to_string(),
-            ip_address: "10.88.0.2".to_string(),
-            gateway: "10.88.0.1".to_string(),
-        }),
+        etherstub_name: etherstub_name.to_string(),
+        pod_cidr: pod_cidr.to_string(),
     };
 
     let controller = PodController::new(
@@ -179,6 +201,7 @@ async fn run_agent(
         api_client.clone(),
         state.event_tx.clone(),
         controller_config,
+        ipam,
     );
     let controller_token = token.clone();
     let controller_handle = tokio::spawn(async move {
@@ -187,7 +210,7 @@ async fn run_agent(
         }
     });
 
-    // 5. Spawn node agent
+    // 6. Spawn node agent
     let node_agent_config = NodeAgentConfig::new(node_name.to_string(), api_url);
     let node_agent = NodeAgent::new(api_client, node_agent_config);
     let agent_token = token.clone();
@@ -198,8 +221,8 @@ async fn run_agent(
     });
 
     info!(
-        "All components started. API server on {}, node name: {}",
-        bind, node_name
+        "All components started. API server on {}, node name: {}, pod CIDR: {}",
+        bind, node_name, pod_cidr
     );
 
     // Wait for shutdown signal

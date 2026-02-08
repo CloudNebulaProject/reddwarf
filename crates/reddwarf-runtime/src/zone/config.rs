@@ -11,12 +11,24 @@ pub fn generate_zonecfg(config: &ZoneConfig) -> Result<String> {
     lines.push("set ip-type=exclusive".to_string());
 
     // Network resource
-    let vnic_name = match &config.network {
-        NetworkMode::Etherstub(cfg) => &cfg.vnic_name,
-        NetworkMode::Direct(cfg) => &cfg.vnic_name,
+    let (vnic_name, ip_address, gateway, prefix_len) = match &config.network {
+        NetworkMode::Etherstub(cfg) => (
+            &cfg.vnic_name,
+            &cfg.ip_address,
+            &cfg.gateway,
+            cfg.prefix_len,
+        ),
+        NetworkMode::Direct(cfg) => (
+            &cfg.vnic_name,
+            &cfg.ip_address,
+            &cfg.gateway,
+            cfg.prefix_len,
+        ),
     };
     lines.push("add net".to_string());
     lines.push(format!("set physical={}", vnic_name));
+    lines.push(format!("set allowed-address={}/{}", ip_address, prefix_len));
+    lines.push(format!("set defrouter={}", gateway));
     lines.push("end".to_string());
 
     // CPU cap
@@ -67,6 +79,7 @@ mod tests {
                 vnic_name: "vnic0".to_string(),
                 ip_address: "10.0.0.2".to_string(),
                 gateway: "10.0.0.1".to_string(),
+                prefix_len: 16,
             }),
             zfs: ZfsConfig {
                 parent_dataset: "rpool/zones".to_string(),
@@ -85,6 +98,8 @@ mod tests {
         assert!(result.contains("set zonepath=/zones/test-zone"));
         assert!(result.contains("set ip-type=exclusive"));
         assert!(result.contains("set physical=vnic0"));
+        assert!(result.contains("set allowed-address=10.0.0.2/16"));
+        assert!(result.contains("set defrouter=10.0.0.1"));
         assert!(result.contains("set ncpus=2.0"));
         assert!(result.contains("set physical=1G"));
         assert!(result.contains("verify"));
@@ -102,6 +117,7 @@ mod tests {
                 vnic_name: "vnic1".to_string(),
                 ip_address: "192.168.1.10".to_string(),
                 gateway: "192.168.1.1".to_string(),
+                prefix_len: 24,
             }),
             zfs: ZfsConfig {
                 parent_dataset: "rpool/zones".to_string(),
@@ -128,6 +144,8 @@ mod tests {
         let result = generate_zonecfg(&config).unwrap();
         assert!(result.contains("set brand=reddwarf"));
         assert!(result.contains("set physical=vnic1"));
+        assert!(result.contains("set allowed-address=192.168.1.10/24"));
+        assert!(result.contains("set defrouter=192.168.1.1"));
         assert!(result.contains("set physical=512M"));
         assert!(result.contains("add fs"));
         assert!(result.contains("set dir=/etc/app"));

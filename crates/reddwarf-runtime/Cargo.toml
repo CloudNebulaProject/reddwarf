@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 reddwarf-core = { workspace = true }
+reddwarf-storage = { workspace = true }
 k8s-openapi = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

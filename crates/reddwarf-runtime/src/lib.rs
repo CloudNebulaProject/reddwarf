@@ -19,6 +19,7 @@ pub mod zone;
 // Re-export primary types
 pub use error::{Result, RuntimeError};
 pub use mock::MockRuntime;
+pub use network::{CidrConfig, IpAllocation, Ipam};
 pub use traits::ZoneRuntime;
 pub use types::{
     ContainerProcess, DirectNicConfig, EtherstubConfig, FsMount, NetworkMode, ZfsConfig, ZoneBrand,

@@ -1393,6 +1393,7 @@ dependencies = [
  "k8s-openapi",
  "miette",
  "reddwarf-core",
+ "reddwarf-storage",
  "reqwest",
  "serde",
  "serde_json",
