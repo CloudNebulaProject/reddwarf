@@ -4,8 +4,12 @@ use async_trait::async_trait;
 
 /// Trait for zone runtime implementations
 ///
-/// This trait abstracts over the illumos zone lifecycle, networking, and ZFS
+/// This trait abstracts over the illumos zone lifecycle and networking
 /// operations. It enables testing via `MockRuntime` on non-illumos platforms.
+///
+/// Storage operations (ZFS dataset create/destroy, snapshots, volumes) are
+/// handled by the separate `StorageEngine` trait, which is injected into
+/// runtime implementations.
 #[async_trait]
 pub trait ZoneRuntime: Send + Sync {
     // --- Zone lifecycle ---
@@ -49,17 +53,6 @@ pub trait ZoneRuntime: Send + Sync {
 
     /// Tear down network for a zone
     async fn teardown_network(&self, zone_name: &str, network: &NetworkMode) -> Result<()>;
-
-    // --- ZFS ---
-
-    /// Create a ZFS dataset for a zone
-    async fn create_zfs_dataset(&self, zone_name: &str, config: &ZoneConfig) -> Result<()>;
-
-    /// Destroy a ZFS dataset for a zone
-    async fn destroy_zfs_dataset(&self, zone_name: &str, config: &ZoneConfig) -> Result<()>;
-
-    /// Create a ZFS snapshot
-    async fn create_snapshot(&self, dataset: &str, snapshot_name: &str) -> Result<()>;
 
     // --- High-level lifecycle ---
 

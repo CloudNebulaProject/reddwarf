@@ -123,14 +123,69 @@ pub struct DirectNicConfig {
     pub prefix_len: u8,
 }
 
-/// ZFS dataset configuration for zone storage
+/// Global storage pool configuration
+///
+/// Derived from a single `--storage-pool` flag (e.g., "rpool"), with optional
+/// per-dataset overrides via `--zones-dataset`, `--images-dataset`, `--volumes-dataset`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ZfsConfig {
-    /// Parent dataset (e.g., "rpool/zones")
-    pub parent_dataset: String,
+pub struct StoragePoolConfig {
+    /// Base pool name (e.g., "rpool" or "datapool")
+    pub pool: String,
+    /// Dataset for zone root filesystems (default: "{pool}/zones")
+    pub zones_dataset: String,
+    /// Dataset for container images (default: "{pool}/images")
+    pub images_dataset: String,
+    /// Dataset for persistent volumes (default: "{pool}/volumes")
+    pub volumes_dataset: String,
+}
+
+impl StoragePoolConfig {
+    /// Create config from a pool name, auto-deriving child datasets
+    pub fn from_pool(pool: &str) -> Self {
+        Self {
+            pool: pool.to_string(),
+            zones_dataset: format!("{}/zones", pool),
+            images_dataset: format!("{}/images", pool),
+            volumes_dataset: format!("{}/volumes", pool),
+        }
+    }
+
+    /// Apply optional overrides for individual datasets
+    pub fn with_overrides(
+        mut self,
+        zones: Option<&str>,
+        images: Option<&str>,
+        volumes: Option<&str>,
+    ) -> Self {
+        if let Some(z) = zones {
+            self.zones_dataset = z.to_string();
+        }
+        if let Some(i) = images {
+            self.images_dataset = i.to_string();
+        }
+        if let Some(v) = volumes {
+            self.volumes_dataset = v.to_string();
+        }
+        self
+    }
+
+    /// Derive the full dataset path for a zone
+    pub fn zone_dataset(&self, zone_name: &str) -> String {
+        format!("{}/{}", self.zones_dataset, zone_name)
+    }
+
+    /// Derive the full dataset path for a volume
+    pub fn volume_dataset(&self, volume_name: &str) -> String {
+        format!("{}/{}", self.volumes_dataset, volume_name)
+    }
+}
+
+/// Per-zone storage options (replaces the old ZfsConfig on ZoneConfig)
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZoneStorageOpts {
     /// Optional snapshot to clone from (fast provisioning)
     pub clone_from: Option<String>,
-    /// Optional quota
+    /// Optional quota (e.g., "10G")
     pub quota: Option<String>,
 }
 
@@ -171,8 +226,8 @@ pub struct ZoneConfig {
     pub zonepath: String,
     /// Network configuration
     pub network: NetworkMode,
-    /// ZFS dataset configuration
-    pub zfs: ZfsConfig,
+    /// Per-zone storage options (clone source, quota)
+    pub storage: ZoneStorageOpts,
     /// LX brand image path (only for Lx brand)
     pub lx_image_path: Option<String>,
     /// Supervised processes (for reddwarf brand)

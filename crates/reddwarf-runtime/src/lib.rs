@@ -11,9 +11,9 @@ pub mod illumos;
 pub mod mock;
 pub mod network;
 pub mod node_agent;
+pub mod storage;
 pub mod traits;
 pub mod types;
-pub mod zfs;
 pub mod zone;
 
 // Re-export primary types
@@ -22,9 +22,14 @@ pub use mock::MockRuntime;
 pub use network::{CidrConfig, IpAllocation, Ipam};
 pub use traits::ZoneRuntime;
 pub use types::{
-    ContainerProcess, DirectNicConfig, EtherstubConfig, FsMount, NetworkMode, ZfsConfig, ZoneBrand,
-    ZoneConfig, ZoneInfo, ZoneState,
+    ContainerProcess, DirectNicConfig, EtherstubConfig, FsMount, NetworkMode, StoragePoolConfig,
+    ZoneBrand, ZoneConfig, ZoneInfo, ZoneState, ZoneStorageOpts,
 };
+
+// Re-export storage types
+#[cfg(target_os = "illumos")]
+pub use storage::ZfsStorageEngine;
+pub use storage::{MockStorageEngine, StorageEngine, VolumeInfo};
 
 // Re-export controller and agent types
 pub use api_client::ApiClient;

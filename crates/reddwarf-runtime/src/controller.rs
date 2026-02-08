@@ -19,8 +19,6 @@ pub struct PodControllerConfig {
     pub api_url: String,
     /// Prefix for zone root paths (e.g., "/zones")
     pub zonepath_prefix: String,
-    /// Parent ZFS dataset (e.g., "rpool/zones")
-    pub zfs_parent_dataset: String,
     /// Default zone brand
     pub default_brand: ZoneBrand,
     /// Name of the etherstub for pod networking
@@ -444,11 +442,7 @@ impl PodController {
             brand: self.config.default_brand.clone(),
             zonepath,
             network,
-            zfs: ZfsConfig {
-                parent_dataset: self.config.zfs_parent_dataset.clone(),
-                clone_from: None,
-                quota: None,
-            },
+            storage: ZoneStorageOpts::default(),
             lx_image_path: None,
             processes,
             cpu_cap: None,
@@ -504,7 +498,10 @@ mod tests {
         let storage = Arc::new(RedbBackend::new(&db_path).unwrap());
         let ipam = Ipam::new(storage, "10.88.0.0/16").unwrap();
 
-        let runtime = Arc::new(crate::mock::MockRuntime::new());
+        let mock_storage = Arc::new(crate::storage::MockStorageEngine::new(
+            crate::types::StoragePoolConfig::from_pool("rpool"),
+        ));
+        let runtime = Arc::new(crate::mock::MockRuntime::new(mock_storage));
         let api_client = Arc::new(ApiClient::new("http://127.0.0.1:6443"));
         let (event_tx, _) = broadcast::channel(16);
 
@@ -512,7 +509,6 @@ mod tests {
             node_name: "node1".to_string(),
             api_url: "http://127.0.0.1:6443".to_string(),
             zonepath_prefix: "/zones".to_string(),
-            zfs_parent_dataset: "rpool/zones".to_string(),
             default_brand: ZoneBrand::Reddwarf,
             etherstub_name: "reddwarf0".to_string(),
             pod_cidr: "10.88.0.0/16".to_string(),
@@ -580,7 +576,6 @@ mod tests {
         assert_eq!(zone_config.processes[1].name, "sidecar");
         assert_eq!(zone_config.processes[1].command, vec!["/bin/sh", "-c"]);
         assert_eq!(zone_config.brand, ZoneBrand::Reddwarf);
-        assert_eq!(zone_config.zfs.parent_dataset, "rpool/zones");
 
         // Verify per-pod networking
         match &zone_config.network {

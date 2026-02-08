@@ -2,8 +2,8 @@ use clap::{Parser, Subcommand};
 use reddwarf_apiserver::{ApiError, ApiServer, AppState, Config as ApiConfig};
 use reddwarf_core::Namespace;
 use reddwarf_runtime::{
-    ApiClient, Ipam, MockRuntime, NodeAgent, NodeAgentConfig, PodController, PodControllerConfig,
-    ZoneBrand,
+    ApiClient, Ipam, MockRuntime, MockStorageEngine, NodeAgent, NodeAgentConfig, PodController,
+    PodControllerConfig, StorageEngine, StoragePoolConfig, ZoneBrand,
 };
 use reddwarf_scheduler::scheduler::SchedulerConfig;
 use reddwarf_scheduler::Scheduler;
@@ -42,12 +42,21 @@ enum Commands {
         /// Path to the redb database file
         #[arg(long, default_value = "./reddwarf.redb")]
         data_dir: String,
-        /// Prefix for zone root paths
-        #[arg(long, default_value = "/zones")]
-        zonepath_prefix: String,
-        /// Parent ZFS dataset for zone storage
-        #[arg(long, default_value = "rpool/zones")]
-        zfs_parent: String,
+        /// Base ZFS storage pool name (auto-derives {pool}/zones, {pool}/images, {pool}/volumes)
+        #[arg(long, default_value = "rpool")]
+        storage_pool: String,
+        /// Override the zones dataset (default: {storage_pool}/zones)
+        #[arg(long)]
+        zones_dataset: Option<String>,
+        /// Override the images dataset (default: {storage_pool}/images)
+        #[arg(long)]
+        images_dataset: Option<String>,
+        /// Override the volumes dataset (default: {storage_pool}/volumes)
+        #[arg(long)]
+        volumes_dataset: Option<String>,
+        /// Prefix for zone root paths (default: derived from storage pool as "/{pool}/zones")
+        #[arg(long)]
+        zonepath_prefix: Option<String>,
         /// Pod network CIDR for IPAM allocation
         #[arg(long, default_value = "10.88.0.0/16")]
         pod_cidr: String,
@@ -75,8 +84,11 @@ async fn main() -> miette::Result<()> {
             node_name,
             bind,
             data_dir,
+            storage_pool,
+            zones_dataset,
+            images_dataset,
+            volumes_dataset,
             zonepath_prefix,
-            zfs_parent,
             pod_cidr,
             etherstub_name,
         } => {
@@ -84,8 +96,11 @@ async fn main() -> miette::Result<()> {
                 &node_name,
                 &bind,
                 &data_dir,
-                &zonepath_prefix,
-                &zfs_parent,
+                &storage_pool,
+                zones_dataset.as_deref(),
+                images_dataset.as_deref(),
+                volumes_dataset.as_deref(),
+                zonepath_prefix.as_deref(),
                 &pod_cidr,
                 &etherstub_name,
             )
@@ -118,12 +133,16 @@ async fn run_serve(bind: &str, data_dir: &str) -> miette::Result<()> {
 }
 
 /// Run the full agent: API server + scheduler + pod controller + node agent
+#[allow(clippy::too_many_arguments)]
 async fn run_agent(
     node_name: &str,
     bind: &str,
     data_dir: &str,
-    zonepath_prefix: &str,
-    zfs_parent: &str,
+    storage_pool: &str,
+    zones_dataset: Option<&str>,
+    images_dataset: Option<&str>,
+    volumes_dataset: Option<&str>,
+    zonepath_prefix: Option<&str>,
     pod_cidr: &str,
     etherstub_name: &str,
 ) -> miette::Result<()> {
@@ -136,6 +155,24 @@ async fn run_agent(
     let listen_addr: std::net::SocketAddr = bind
         .parse()
         .map_err(|e| miette::miette!("Invalid bind address '{}': {}", bind, e))?;
+
+    // Build storage pool configuration
+    let pool_config = StoragePoolConfig::from_pool(storage_pool).with_overrides(
+        zones_dataset,
+        images_dataset,
+        volumes_dataset,
+    );
+
+    // Derive zonepath prefix from pool or use explicit override
+    let zonepath_prefix = zonepath_prefix
+        .unwrap_or_else(|| Box::leak(format!("/{}", pool_config.zones_dataset).into_boxed_str()));
+
+    // Create and initialize storage engine
+    let storage_engine: Arc<dyn StorageEngine> = create_storage_engine(pool_config);
+    storage_engine
+        .initialize()
+        .await
+        .map_err(|e| miette::miette!("Failed to initialize storage: {}", e))?;
 
     // Determine the API URL for internal components to connect to
     let api_url = format!("http://127.0.0.1:{}", listen_addr.port());
@@ -176,8 +213,8 @@ async fn run_agent(
         }
     });
 
-    // 3. Create runtime (MockRuntime on non-illumos, IllumosRuntime on illumos)
-    let runtime: Arc<dyn reddwarf_runtime::ZoneRuntime> = create_runtime();
+    // 3. Create runtime with injected storage engine
+    let runtime: Arc<dyn reddwarf_runtime::ZoneRuntime> = create_runtime(storage_engine);
 
     // 4. Create IPAM for per-pod IP allocation
     let ipam = Ipam::new(state.storage.clone(), pod_cidr).map_err(|e| {
@@ -190,7 +227,6 @@ async fn run_agent(
         node_name: node_name.to_string(),
         api_url: api_url.clone(),
         zonepath_prefix: zonepath_prefix.to_string(),
-        zfs_parent_dataset: zfs_parent.to_string(),
         default_brand: ZoneBrand::Reddwarf,
         etherstub_name: etherstub_name.to_string(),
         pod_cidr: pod_cidr.to_string(),
@@ -287,16 +323,30 @@ fn create_app_state(data_dir: &str) -> miette::Result<Arc<AppState>> {
     Ok(Arc::new(AppState::new(storage, version_store)))
 }
 
+/// Create the appropriate storage engine for this platform
+fn create_storage_engine(config: StoragePoolConfig) -> Arc<dyn StorageEngine> {
+    #[cfg(target_os = "illumos")]
+    {
+        info!("Using ZfsStorageEngine (native ZFS support)");
+        Arc::new(reddwarf_runtime::ZfsStorageEngine::new(config))
+    }
+    #[cfg(not(target_os = "illumos"))]
+    {
+        info!("Using MockStorageEngine (in-memory storage for development)");
+        Arc::new(MockStorageEngine::new(config))
+    }
+}
+
 /// Create the appropriate zone runtime for this platform
-fn create_runtime() -> Arc<dyn reddwarf_runtime::ZoneRuntime> {
+fn create_runtime(storage: Arc<dyn StorageEngine>) -> Arc<dyn reddwarf_runtime::ZoneRuntime> {
     #[cfg(target_os = "illumos")]
     {
         info!("Using IllumosRuntime (native zone support)");
-        Arc::new(reddwarf_runtime::IllumosRuntime::new())
+        Arc::new(reddwarf_runtime::IllumosRuntime::new(storage))
     }
     #[cfg(not(target_os = "illumos"))]
     {
         info!("Using MockRuntime (illumos zone emulation for development)");
-        Arc::new(MockRuntime::new())
+        Arc::new(MockRuntime::new(storage))
     }
 }

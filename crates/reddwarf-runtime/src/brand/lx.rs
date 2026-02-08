@@ -30,11 +30,7 @@ mod tests {
                 gateway: "10.0.0.1".to_string(),
                 prefix_len: 16,
             }),
-            zfs: ZfsConfig {
-                parent_dataset: "rpool/zones".to_string(),
-                clone_from: None,
-                quota: None,
-            },
+            storage: ZoneStorageOpts::default(),
             lx_image_path: image_path,
             processes: vec![],
             cpu_cap: None,

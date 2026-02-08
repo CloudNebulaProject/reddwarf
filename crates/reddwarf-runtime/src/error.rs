@@ -131,6 +131,19 @@ pub enum RuntimeError {
         cidr: String,
     },
 
+    /// Storage initialization failed
+    #[error("Storage initialization failed: {message}")]
+    #[diagnostic(
+        code(reddwarf::runtime::storage_init_failed),
+        help("Verify the ZFS pool '{pool}' exists and you have permission to create datasets. Run: zpool list")
+    )]
+    StorageInitFailed {
+        #[allow(unused)]
+        pool: String,
+        #[allow(unused)]
+        message: String,
+    },
+
     /// Internal error
     #[error("Internal runtime error: {message}")]
     #[diagnostic(

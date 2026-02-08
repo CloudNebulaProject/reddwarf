@@ -1,4 +1,5 @@
 use crate::error::{Result, RuntimeError};
+use crate::storage::StorageEngine;
 use crate::traits::ZoneRuntime;
 use crate::types::*;
 use async_trait::async_trait;
@@ -18,24 +19,21 @@ struct MockZone {
 /// Mock runtime for testing on non-illumos platforms
 ///
 /// Maintains an in-memory zone registry and simulates state transitions.
-/// All network/ZFS operations are no-ops.
+/// All network operations are no-ops. Storage operations are delegated to
+/// the injected `StorageEngine`.
 pub struct MockRuntime {
     zones: Arc<RwLock<HashMap<String, MockZone>>>,
     next_id: Arc<RwLock<i32>>,
+    storage: Arc<dyn StorageEngine>,
 }
 
 impl MockRuntime {
-    pub fn new() -> Self {
+    pub fn new(storage: Arc<dyn StorageEngine>) -> Self {
         Self {
             zones: Arc::new(RwLock::new(HashMap::new())),
             next_id: Arc::new(RwLock::new(1)),
+            storage,
         }
-    }
-}
-
-impl Default for MockRuntime {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -235,23 +233,10 @@ impl ZoneRuntime for MockRuntime {
         Ok(())
     }
 
-    async fn create_zfs_dataset(&self, zone_name: &str, _config: &ZoneConfig) -> Result<()> {
-        debug!("Mock: ZFS dataset created for zone: {}", zone_name);
-        Ok(())
-    }
-
-    async fn destroy_zfs_dataset(&self, zone_name: &str, _config: &ZoneConfig) -> Result<()> {
-        debug!("Mock: ZFS dataset destroyed for zone: {}", zone_name);
-        Ok(())
-    }
-
-    async fn create_snapshot(&self, dataset: &str, snapshot_name: &str) -> Result<()> {
-        debug!("Mock: ZFS snapshot created: {}@{}", dataset, snapshot_name);
-        Ok(())
-    }
-
     async fn provision(&self, config: &ZoneConfig) -> Result<()> {
-        self.create_zfs_dataset(&config.zone_name, config).await?;
+        self.storage
+            .create_zone_dataset(&config.zone_name, &config.storage)
+            .await?;
         self.setup_network(&config.zone_name, &config.network)
             .await?;
         self.create_zone(config).await?;
@@ -293,7 +278,7 @@ impl ZoneRuntime for MockRuntime {
 
         self.teardown_network(&config.zone_name, &config.network)
             .await?;
-        self.destroy_zfs_dataset(&config.zone_name, config).await?;
+        self.storage.destroy_zone_dataset(&config.zone_name).await?;
         Ok(())
     }
 }
@@ -301,6 +286,14 @@ impl ZoneRuntime for MockRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::MockStorageEngine;
+    use crate::types::StoragePoolConfig;
+
+    fn make_test_storage() -> Arc<dyn StorageEngine> {
+        Arc::new(MockStorageEngine::new(StoragePoolConfig::from_pool(
+            "rpool",
+        )))
+    }
 
     fn make_test_config(name: &str) -> ZoneConfig {
         ZoneConfig {
@@ -314,11 +307,7 @@ mod tests {
                 gateway: "10.0.0.1".to_string(),
                 prefix_len: 16,
             }),
-            zfs: ZfsConfig {
-                parent_dataset: "rpool/zones".to_string(),
-                clone_from: None,
-                quota: None,
-            },
+            storage: ZoneStorageOpts::default(),
             lx_image_path: None,
             processes: vec![],
             cpu_cap: None,
@@ -329,7 +318,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_provision_transitions_to_running() {
-        let rt = MockRuntime::new();
+        let rt = MockRuntime::new(make_test_storage());
         let config = make_test_config("test-zone");
 
         rt.provision(&config).await.unwrap();
@@ -340,7 +329,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_deprovision_removes_zone() {
-        let rt = MockRuntime::new();
+        let rt = MockRuntime::new(make_test_storage());
         let config = make_test_config("test-zone");
 
         rt.provision(&config).await.unwrap();
@@ -352,7 +341,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_duplicate_create_zone_returns_error() {
-        let rt = MockRuntime::new();
+        let rt = MockRuntime::new(make_test_storage());
         let config = make_test_config("test-zone");
 
         rt.create_zone(&config).await.unwrap();
@@ -365,7 +354,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ops_on_missing_zone_return_not_found() {
-        let rt = MockRuntime::new();
+        let rt = MockRuntime::new(make_test_storage());
 
         assert!(matches!(
             rt.get_zone_state("nonexistent").await.unwrap_err(),
@@ -383,7 +372,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_zones_returns_all_provisioned() {
-        let rt = MockRuntime::new();
+        let rt = MockRuntime::new(make_test_storage());
 
         for i in 0..3 {
             let config = make_test_config(&format!("zone-{}", i));
@@ -396,7 +385,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_zone_info() {
-        let rt = MockRuntime::new();
+        let rt = MockRuntime::new(make_test_storage());
         let config = make_test_config("info-zone");
 
         rt.provision(&config).await.unwrap();

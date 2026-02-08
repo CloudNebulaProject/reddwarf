@@ -1,28 +1,26 @@
 use crate::brand::lx::lx_install_args;
 use crate::command::exec;
-use crate::error::{Result, RuntimeError};
+use crate::error::Result;
+use crate::storage::StorageEngine;
 use crate::traits::ZoneRuntime;
 use crate::types::*;
-use crate::zfs;
 use crate::zone::config::generate_zonecfg;
 use crate::zone::state::parse_zoneadm_line;
 use async_trait::async_trait;
+use std::sync::Arc;
 use tracing::info;
 
 /// illumos zone runtime implementation
 ///
-/// Manages real zones via zonecfg/zoneadm, dladm for networking, and zfs for storage.
-pub struct IllumosRuntime;
-
-impl IllumosRuntime {
-    pub fn new() -> Self {
-        Self
-    }
+/// Manages real zones via zonecfg/zoneadm, dladm for networking.
+/// Storage (ZFS datasets) is delegated to the injected `StorageEngine`.
+pub struct IllumosRuntime {
+    storage: Arc<dyn StorageEngine>,
 }
 
-impl Default for IllumosRuntime {
-    fn default() -> Self {
-        Self::new()
+impl IllumosRuntime {
+    pub fn new(storage: Arc<dyn StorageEngine>) -> Self {
+        Self { storage }
     }
 }
 
@@ -37,7 +35,9 @@ impl ZoneRuntime for IllumosRuntime {
         let tmp_path = format!("/tmp/zonecfg-{}.cmd", config.zone_name);
         tokio::fs::write(&tmp_path, &zonecfg_content)
             .await
-            .map_err(|e| RuntimeError::zone_operation_failed(&config.zone_name, e.to_string()))?;
+            .map_err(|e| {
+                crate::error::RuntimeError::zone_operation_failed(&config.zone_name, e.to_string())
+            })?;
 
         let result = exec("zonecfg", &["-z", &config.zone_name, "-f", &tmp_path]).await;
 
@@ -166,47 +166,12 @@ impl ZoneRuntime for IllumosRuntime {
         Ok(())
     }
 
-    async fn create_zfs_dataset(&self, zone_name: &str, config: &ZoneConfig) -> Result<()> {
-        info!("Creating ZFS dataset for zone: {}", zone_name);
-
-        let dataset = zfs::dataset_path(&config.zfs, zone_name);
-
-        if let Some(ref clone_from) = config.zfs.clone_from {
-            // Fast clone path
-            exec("zfs", &["clone", clone_from, &dataset]).await?;
-        } else {
-            exec("zfs", &["create", &dataset]).await?;
-        }
-
-        if let Some(ref quota) = config.zfs.quota {
-            exec("zfs", &["set", &format!("quota={}", quota), &dataset]).await?;
-        }
-
-        info!("ZFS dataset created: {}", dataset);
-        Ok(())
-    }
-
-    async fn destroy_zfs_dataset(&self, zone_name: &str, config: &ZoneConfig) -> Result<()> {
-        info!("Destroying ZFS dataset for zone: {}", zone_name);
-
-        let dataset = zfs::dataset_path(&config.zfs, zone_name);
-        exec("zfs", &["destroy", "-r", &dataset]).await?;
-
-        info!("ZFS dataset destroyed: {}", dataset);
-        Ok(())
-    }
-
-    async fn create_snapshot(&self, dataset: &str, snapshot_name: &str) -> Result<()> {
-        let snap = format!("{}@{}", dataset, snapshot_name);
-        exec("zfs", &["snapshot", &snap]).await?;
-        info!("ZFS snapshot created: {}", snap);
-        Ok(())
-    }
-
     async fn provision(&self, config: &ZoneConfig) -> Result<()> {
         info!("Provisioning zone: {}", config.zone_name);
 
-        self.create_zfs_dataset(&config.zone_name, config).await?;
+        self.storage
+            .create_zone_dataset(&config.zone_name, &config.storage)
+            .await?;
         self.setup_network(&config.zone_name, &config.network)
             .await?;
         self.create_zone(config).await?;
@@ -237,7 +202,7 @@ impl ZoneRuntime for IllumosRuntime {
         self.delete_zone(&config.zone_name).await?;
         self.teardown_network(&config.zone_name, &config.network)
             .await?;
-        self.destroy_zfs_dataset(&config.zone_name, config).await?;
+        self.storage.destroy_zone_dataset(&config.zone_name).await?;
 
         info!("Zone deprovisioned: {}", config.zone_name);
         Ok(())
