@@ -1,3 +1,7 @@
+pub mod quantities;
+
+pub use quantities::ResourceQuantities;
+
 use crate::{GroupVersionKind, ResourceKey, ResourceVersion};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use serde::{Deserialize, Serialize};

@@ -14,7 +14,7 @@ pub mod types;
 // Re-export commonly used types
 pub use error::{ReddwarfError, Result};
 pub use events::{ResourceEvent, WatchEventType};
-pub use resources::{is_valid_name, Resource, ResourceError};
+pub use resources::{is_valid_name, Resource, ResourceError, ResourceQuantities};
 pub use types::{GroupVersionKind, ResourceKey, ResourceVersion};
 
 // Re-export k8s-openapi types for convenience

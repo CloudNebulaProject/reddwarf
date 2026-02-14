@@ -4,7 +4,7 @@ use crate::network::{vnic_name_for_pod, Ipam};
 use crate::traits::ZoneRuntime;
 use crate::types::*;
 use k8s_openapi::api::core::v1::{Pod, PodCondition, PodStatus};
-use reddwarf_core::{ResourceEvent, WatchEventType};
+use reddwarf_core::{ResourceEvent, ResourceQuantities, WatchEventType};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -437,6 +437,37 @@ impl PodController {
             })
             .collect();
 
+        // Aggregate resource limits across all containers in the pod.
+        // Prefer limits (hard cap) over requests (soft guarantee).
+        let (total_cpu_millicores, total_memory_bytes) =
+            spec.containers.iter().fold((0i64, 0i64), |(cpu, mem), c| {
+                let resources = c.resources.as_ref();
+                let res_map = resources
+                    .and_then(|r| r.limits.as_ref())
+                    .or_else(|| resources.and_then(|r| r.requests.as_ref()));
+
+                let (c_cpu, c_mem) = match res_map {
+                    Some(map) => {
+                        let rq = ResourceQuantities::from_k8s_resource_map(map);
+                        (rq.cpu_millicores, rq.memory_bytes)
+                    }
+                    None => (0, 0),
+                };
+                (cpu + c_cpu, mem + c_mem)
+            });
+
+        let cpu_cap = if total_cpu_millicores > 0 {
+            Some(ResourceQuantities::cpu_as_zone_cap(total_cpu_millicores))
+        } else {
+            None
+        };
+
+        let memory_cap = if total_memory_bytes > 0 {
+            Some(ResourceQuantities::memory_as_zone_cap(total_memory_bytes))
+        } else {
+            None
+        };
+
         Ok(ZoneConfig {
             zone_name,
             brand: self.config.default_brand.clone(),
@@ -445,8 +476,8 @@ impl PodController {
             storage: ZoneStorageOpts::default(),
             lx_image_path: None,
             processes,
-            cpu_cap: None,
-            memory_cap: None,
+            cpu_cap,
+            memory_cap,
             fs_mounts: vec![],
         })
     }
@@ -645,5 +676,142 @@ mod tests {
 
         let result = controller.pod_to_zone_config(&pod);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_pod_to_zone_config_with_cpu_and_memory_limits() {
+        use k8s_openapi::api::core::v1::ResourceRequirements;
+        use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+        use std::collections::BTreeMap;
+
+        let (controller, _dir) = make_test_controller();
+
+        let mut limits = BTreeMap::new();
+        limits.insert("cpu".to_string(), Quantity("1".to_string()));
+        limits.insert("memory".to_string(), Quantity("512Mi".to_string()));
+
+        let mut pod = Pod::default();
+        pod.metadata.name = Some("capped-pod".to_string());
+        pod.metadata.namespace = Some("default".to_string());
+        pod.spec = Some(PodSpec {
+            containers: vec![Container {
+                name: "web".to_string(),
+                command: Some(vec!["/bin/sh".to_string()]),
+                resources: Some(ResourceRequirements {
+                    limits: Some(limits),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let zone_config = controller.pod_to_zone_config(&pod).unwrap();
+        assert_eq!(zone_config.cpu_cap, Some("1.00".to_string()));
+        assert_eq!(zone_config.memory_cap, Some("512M".to_string()));
+    }
+
+    #[test]
+    fn test_pod_to_zone_config_with_requests_fallback() {
+        use k8s_openapi::api::core::v1::ResourceRequirements;
+        use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+        use std::collections::BTreeMap;
+
+        let (controller, _dir) = make_test_controller();
+
+        let mut requests = BTreeMap::new();
+        requests.insert("cpu".to_string(), Quantity("500m".to_string()));
+        requests.insert("memory".to_string(), Quantity("256Mi".to_string()));
+
+        let mut pod = Pod::default();
+        pod.metadata.name = Some("req-pod".to_string());
+        pod.metadata.namespace = Some("default".to_string());
+        pod.spec = Some(PodSpec {
+            containers: vec![Container {
+                name: "web".to_string(),
+                command: Some(vec!["/bin/sh".to_string()]),
+                resources: Some(ResourceRequirements {
+                    requests: Some(requests),
+                    limits: None,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let zone_config = controller.pod_to_zone_config(&pod).unwrap();
+        assert_eq!(zone_config.cpu_cap, Some("0.50".to_string()));
+        assert_eq!(zone_config.memory_cap, Some("256M".to_string()));
+    }
+
+    #[test]
+    fn test_pod_to_zone_config_aggregates_multiple_containers() {
+        use k8s_openapi::api::core::v1::ResourceRequirements;
+        use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+        use std::collections::BTreeMap;
+
+        let (controller, _dir) = make_test_controller();
+
+        let make_limits = |cpu: &str, mem: &str| {
+            let mut limits = BTreeMap::new();
+            limits.insert("cpu".to_string(), Quantity(cpu.to_string()));
+            limits.insert("memory".to_string(), Quantity(mem.to_string()));
+            limits
+        };
+
+        let mut pod = Pod::default();
+        pod.metadata.name = Some("multi-pod".to_string());
+        pod.metadata.namespace = Some("default".to_string());
+        pod.spec = Some(PodSpec {
+            containers: vec![
+                Container {
+                    name: "web".to_string(),
+                    command: Some(vec!["/bin/sh".to_string()]),
+                    resources: Some(ResourceRequirements {
+                        limits: Some(make_limits("500m", "256Mi")),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                Container {
+                    name: "sidecar".to_string(),
+                    command: Some(vec!["/bin/sh".to_string()]),
+                    resources: Some(ResourceRequirements {
+                        limits: Some(make_limits("500m", "256Mi")),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+
+        let zone_config = controller.pod_to_zone_config(&pod).unwrap();
+        // 500m + 500m = 1000m = 1.00
+        assert_eq!(zone_config.cpu_cap, Some("1.00".to_string()));
+        // 256Mi + 256Mi = 512Mi
+        assert_eq!(zone_config.memory_cap, Some("512M".to_string()));
+    }
+
+    #[test]
+    fn test_pod_to_zone_config_no_resources() {
+        let (controller, _dir) = make_test_controller();
+
+        let mut pod = Pod::default();
+        pod.metadata.name = Some("bare-pod".to_string());
+        pod.metadata.namespace = Some("default".to_string());
+        pod.spec = Some(PodSpec {
+            containers: vec![Container {
+                name: "web".to_string(),
+                command: Some(vec!["/bin/sh".to_string()]),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let zone_config = controller.pod_to_zone_config(&pod).unwrap();
+        assert_eq!(zone_config.cpu_cap, None);
+        assert_eq!(zone_config.memory_cap, None);
     }
 }
