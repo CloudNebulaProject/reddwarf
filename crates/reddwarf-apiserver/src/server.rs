@@ -1,10 +1,12 @@
 use crate::handlers::*;
+use crate::tls::{self, TlsMaterial, TlsMode};
 use crate::AppState;
 use axum::routing::get;
 use axum::Router;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
@@ -13,12 +15,15 @@ use tracing::info;
 pub struct Config {
     /// Address to listen on
     pub listen_addr: SocketAddr,
+    /// TLS configuration
+    pub tls_mode: TlsMode,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             listen_addr: "127.0.0.1:6443".parse().unwrap(),
+            tls_mode: TlsMode::Disabled,
         }
     }
 }
@@ -33,6 +38,15 @@ impl ApiServer {
     /// Create a new API server
     pub fn new(config: Config, state: Arc<AppState>) -> Self {
         Self { config, state }
+    }
+
+    /// Resolve TLS material from the configured mode.
+    ///
+    /// Returns `None` when TLS is disabled. Call this before `run()` to extract
+    /// the CA PEM for passing to internal clients that need to trust the
+    /// self-signed certificate.
+    pub fn resolve_tls_material(&self) -> miette::Result<Option<TlsMaterial>> {
+        tls::resolve_tls(&self.config.tls_mode)
     }
 
     /// Build the router
@@ -94,15 +108,56 @@ impl ApiServer {
             .with_state(self.state.clone())
     }
 
-    /// Run the server
-    pub async fn run(self) -> Result<(), std::io::Error> {
+    /// Run the server, shutting down gracefully when `token` is cancelled.
+    pub async fn run(self, token: CancellationToken) -> Result<(), std::io::Error> {
         let app = self.build_router();
 
-        info!("Starting API server on {}", self.config.listen_addr);
+        let tls_material = self
+            .resolve_tls_material()
+            .map_err(|e| std::io::Error::other(format!("TLS setup failed: {e}")))?;
 
-        let listener = TcpListener::bind(self.config.listen_addr).await?;
+        match tls_material {
+            None => {
+                info!(
+                    "Starting API server on {} (plain HTTP)",
+                    self.config.listen_addr
+                );
+                let listener = TcpListener::bind(self.config.listen_addr).await?;
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        token.cancelled().await;
+                    })
+                    .await
+            }
+            Some(material) => {
+                info!(
+                    "Starting API server on {} (HTTPS)",
+                    self.config.listen_addr
+                );
+                let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem(
+                    material.cert_pem,
+                    material.key_pem,
+                )
+                .await
+                .map_err(|e| {
+                    std::io::Error::other(format!("failed to build RustlsConfig: {e}"))
+                })?;
 
-        axum::serve(listener, app).await
+                let handle = axum_server::Handle::new();
+                let shutdown_handle = handle.clone();
+
+                tokio::spawn(async move {
+                    token.cancelled().await;
+                    shutdown_handle
+                        .graceful_shutdown(Some(std::time::Duration::from_secs(10)));
+                });
+
+                axum_server::bind_rustls(self.config.listen_addr, rustls_config)
+                    .handle(handle)
+                    .serve(app.into_make_service())
+                    .await
+            }
+        }
     }
 }
 
@@ -132,6 +187,7 @@ mod tests {
     fn test_default_config() {
         let config = Config::default();
         assert_eq!(config.listen_addr.to_string(), "127.0.0.1:6443");
+        assert!(matches!(config.tls_mode, TlsMode::Disabled));
     }
 
     #[test]

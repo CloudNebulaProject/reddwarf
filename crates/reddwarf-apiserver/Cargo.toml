@@ -26,6 +26,11 @@ uuid = { workspace = true }
 tokio-stream = { workspace = true }
 futures-util = { workspace = true }
 json-patch = "3.0"
+rcgen = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+axum-server = { workspace = true }
+tokio-util = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

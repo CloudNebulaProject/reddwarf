@@ -13,6 +13,7 @@ pub mod handlers;
 pub mod response;
 pub mod server;
 pub mod state;
+pub mod tls;
 pub mod validation;
 pub mod watch;
 
@@ -21,3 +22,4 @@ pub use error::{ApiError, Result};
 pub use event_bus::ResourceEvent;
 pub use server::{ApiServer, Config};
 pub use state::AppState;
+pub use tls::{TlsMaterial, TlsMode};

@@ -20,10 +20,52 @@ pub struct WatchEvent<T> {
 
 impl ApiClient {
     pub fn new(base_url: &str) -> Self {
+        Self::with_ca_cert(base_url, None)
+    }
+
+    /// Create a client that optionally trusts an additional CA certificate.
+    ///
+    /// When connecting to a server with a self-signed certificate, pass the
+    /// CA PEM bytes here so the client will accept it.
+    pub fn with_ca_cert(base_url: &str, ca_pem: Option<&[u8]>) -> Self {
+        let mut builder = Client::builder();
+
+        if let Some(pem) = ca_pem {
+            if let Ok(cert) = reqwest::Certificate::from_pem(pem) {
+                builder = builder.add_root_certificate(cert);
+            }
+        }
+
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            client: Client::new(),
+            client: builder.build().unwrap_or_else(|_| Client::new()),
         }
+    }
+
+    /// Generic GET that returns a JSON value.
+    pub async fn get_json(&self, path: &str) -> Result<serde_json::Value> {
+        let url = format!("{}{}", self.base_url, path);
+        debug!("GET {}", url);
+
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| RuntimeError::internal_error(format!("HTTP request failed: {}", e)))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(RuntimeError::internal_error(format!(
+                "GET {} failed with status {}: {}",
+                path, status, body
+            )));
+        }
+
+        resp.json::<serde_json::Value>()
+            .await
+            .map_err(|e| RuntimeError::internal_error(format!("Failed to parse response: {}", e)))
     }
 
     /// GET /api/v1/namespaces/{namespace}/pods/{name}
@@ -187,5 +229,29 @@ impl ApiClient {
 
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_builds_client() {
+        let client = ApiClient::new("http://127.0.0.1:6443");
+        assert_eq!(client.base_url(), "http://127.0.0.1:6443");
+    }
+
+    #[test]
+    fn test_with_ca_cert_none() {
+        let client = ApiClient::with_ca_cert("https://127.0.0.1:6443", None);
+        assert_eq!(client.base_url(), "https://127.0.0.1:6443");
+    }
+
+    #[test]
+    fn test_with_ca_cert_invalid_pem_falls_back() {
+        // Invalid PEM should not panic — just builds a client without the cert
+        let client = ApiClient::with_ca_cert("https://127.0.0.1:6443", Some(b"not-a-pem"));
+        assert_eq!(client.base_url(), "https://127.0.0.1:6443");
     }
 }

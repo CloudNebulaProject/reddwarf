@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use reddwarf_apiserver::{ApiError, ApiServer, AppState, Config as ApiConfig};
+use reddwarf_apiserver::{ApiError, ApiServer, AppState, Config as ApiConfig, TlsMode};
 use reddwarf_core::Namespace;
 use reddwarf_runtime::{
     ApiClient, Ipam, MockRuntime, MockStorageEngine, NodeAgent, NodeAgentConfig, PodController,
@@ -9,6 +9,7 @@ use reddwarf_scheduler::scheduler::SchedulerConfig;
 use reddwarf_scheduler::Scheduler;
 use reddwarf_storage::RedbBackend;
 use reddwarf_versioning::VersionStore;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
@@ -18,6 +19,23 @@ use tracing::{error, info};
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+/// Shared TLS arguments for both `serve` and `agent` subcommands.
+#[derive(clap::Args, Clone, Debug)]
+struct TlsArgs {
+    /// Enable TLS (HTTPS). When set without --tls-cert/--tls-key, a
+    /// self-signed CA + server certificate is auto-generated.
+    #[arg(long, default_value_t = false)]
+    tls: bool,
+
+    /// Path to a PEM-encoded TLS certificate (requires --tls)
+    #[arg(long, requires = "tls")]
+    tls_cert: Option<String>,
+
+    /// Path to a PEM-encoded TLS private key (requires --tls)
+    #[arg(long, requires = "tls")]
+    tls_key: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -30,6 +48,8 @@ enum Commands {
         /// Path to the redb database file
         #[arg(long, default_value = "./reddwarf.redb")]
         data_dir: String,
+        #[command(flatten)]
+        tls_args: TlsArgs,
     },
     /// Run as a full node agent (API server + scheduler + controller + heartbeat)
     Agent {
@@ -63,6 +83,8 @@ enum Commands {
         /// Etherstub name for pod networking
         #[arg(long, default_value = "reddwarf0")]
         etherstub_name: String,
+        #[command(flatten)]
+        tls_args: TlsArgs,
     },
 }
 
@@ -79,7 +101,11 @@ async fn main() -> miette::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Serve { bind, data_dir } => run_serve(&bind, &data_dir).await,
+        Commands::Serve {
+            bind,
+            data_dir,
+            tls_args,
+        } => run_serve(&bind, &data_dir, &tls_args).await,
         Commands::Agent {
             node_name,
             bind,
@@ -91,6 +117,7 @@ async fn main() -> miette::Result<()> {
             zonepath_prefix,
             pod_cidr,
             etherstub_name,
+            tls_args,
         } => {
             run_agent(
                 &node_name,
@@ -103,31 +130,86 @@ async fn main() -> miette::Result<()> {
                 zonepath_prefix.as_deref(),
                 &pod_cidr,
                 &etherstub_name,
+                &tls_args,
             )
             .await
         }
     }
 }
 
+/// Wait for either SIGINT (ctrl-c) or SIGTERM, returning which one fired.
+async fn shutdown_signal() -> &'static str {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "SIGINT",
+        _ = sigterm.recv() => "SIGTERM",
+    }
+}
+
+/// Derive a `TlsMode` from CLI arguments.
+fn tls_mode_from_args(args: &TlsArgs, data_dir: &str) -> miette::Result<TlsMode> {
+    if !args.tls {
+        return Ok(TlsMode::Disabled);
+    }
+
+    match (&args.tls_cert, &args.tls_key) {
+        (Some(cert), Some(key)) => Ok(TlsMode::Provided {
+            cert_path: PathBuf::from(cert),
+            key_path: PathBuf::from(key),
+        }),
+        (None, None) => {
+            let parent = PathBuf::from(data_dir)
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_path_buf();
+            Ok(TlsMode::AutoGenerate {
+                data_dir: parent.join("tls"),
+                san_entries: vec!["localhost".to_string(), "127.0.0.1".to_string()],
+            })
+        }
+        _ => Err(miette::miette!(
+            help = "Provide both --tls-cert and --tls-key, or omit both to auto-generate.",
+            "When using --tls, you must supply both --tls-cert and --tls-key together"
+        )),
+    }
+}
+
 /// Run only the API server
-async fn run_serve(bind: &str, data_dir: &str) -> miette::Result<()> {
+async fn run_serve(bind: &str, data_dir: &str, tls_args: &TlsArgs) -> miette::Result<()> {
     info!("Starting reddwarf API server");
 
     let state = create_app_state(data_dir)?;
 
     bootstrap_default_namespace(&state).await?;
 
+    let tls_mode = tls_mode_from_args(tls_args, data_dir)?;
+
     let config = ApiConfig {
         listen_addr: bind
             .parse()
             .map_err(|e| miette::miette!("Invalid bind address '{}': {}", bind, e))?,
+        tls_mode,
     };
 
+    let token = CancellationToken::new();
     let server = ApiServer::new(config, state);
-    server
-        .run()
-        .await
-        .map_err(|e| miette::miette!("API server error: {}", e))?;
+    let server_token = token.clone();
+
+    let server_handle = tokio::spawn(async move {
+        if let Err(e) = server.run(server_token).await {
+            error!("API server error: {}", e);
+        }
+    });
+
+    let sig = shutdown_signal().await;
+    info!("Received {}, shutting down gracefully...", sig);
+    token.cancel();
+
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server_handle).await;
+    info!("Shutdown complete");
 
     Ok(())
 }
@@ -145,6 +227,7 @@ async fn run_agent(
     zonepath_prefix: Option<&str>,
     pod_cidr: &str,
     etherstub_name: &str,
+    tls_args: &TlsArgs,
 ) -> miette::Result<()> {
     info!("Starting reddwarf agent for node '{}'", node_name);
 
@@ -174,25 +257,30 @@ async fn run_agent(
         .await
         .map_err(|e| miette::miette!("Failed to initialize storage: {}", e))?;
 
-    // Determine the API URL for internal components to connect to
-    let api_url = format!("http://127.0.0.1:{}", listen_addr.port());
+    // Build TLS mode
+    let tls_mode = tls_mode_from_args(tls_args, data_dir)?;
+    let tls_enabled = !matches!(tls_mode, TlsMode::Disabled);
+
+    // Determine the API URL for internal components
+    let scheme = if tls_enabled { "https" } else { "http" };
+    let api_url = format!("{scheme}://127.0.0.1:{}", listen_addr.port());
 
     let token = CancellationToken::new();
 
-    // 1. Spawn API server
-    let api_config = ApiConfig { listen_addr };
+    // 1. Build API server and resolve TLS material *before* spawning
+    let api_config = ApiConfig {
+        listen_addr,
+        tls_mode,
+    };
     let api_server = ApiServer::new(api_config, state.clone());
+
+    let tls_material = api_server.resolve_tls_material()?;
+    let ca_pem = tls_material.as_ref().and_then(|m| m.ca_pem.clone());
+
     let api_token = token.clone();
     let api_handle = tokio::spawn(async move {
-        tokio::select! {
-            result = api_server.run() => {
-                if let Err(e) = result {
-                    error!("API server error: {}", e);
-                }
-            }
-            _ = api_token.cancelled() => {
-                info!("API server shutting down");
-            }
+        if let Err(e) = api_server.run(api_token).await {
+            error!("API server error: {}", e);
         }
     });
 
@@ -222,7 +310,7 @@ async fn run_agent(
     })?;
 
     // 5. Spawn pod controller
-    let api_client = Arc::new(ApiClient::new(&api_url));
+    let api_client = Arc::new(ApiClient::with_ca_cert(&api_url, ca_pem.as_deref()));
     let controller_config = PodControllerConfig {
         node_name: node_name.to_string(),
         api_url: api_url.clone(),
@@ -261,12 +349,9 @@ async fn run_agent(
         bind, node_name, pod_cidr
     );
 
-    // Wait for shutdown signal
-    tokio::signal::ctrl_c()
-        .await
-        .map_err(|e| miette::miette!("Failed to listen for ctrl-c: {}", e))?;
-
-    info!("Shutting down gracefully...");
+    // Wait for shutdown signal (SIGINT or SIGTERM)
+    let sig = shutdown_signal().await;
+    info!("Received {}, shutting down gracefully...", sig);
     token.cancel();
 
     // Wait for all tasks to finish with a timeout

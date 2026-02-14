@@ -132,19 +132,8 @@ impl PodController {
     async fn reconcile_all(&self) -> Result<()> {
         debug!("Running pod controller reconcile cycle");
 
-        // List all pods via the API
-        let url = format!("{}/api/v1/pods", self.api_client.base_url());
-        let resp = reqwest::get(&url)
-            .await
-            .map_err(|e| RuntimeError::internal_error(format!("Failed to list pods: {}", e)))?;
-
-        if !resp.status().is_success() {
-            return Err(RuntimeError::internal_error("Failed to list pods"));
-        }
-
-        let body: serde_json::Value = resp.json().await.map_err(|e| {
-            RuntimeError::internal_error(format!("Failed to parse pod list: {}", e))
-        })?;
+        // List all pods via the API client (respects TLS configuration)
+        let body = self.api_client.get_json("/api/v1/pods").await?;
 
         let items = body["items"].as_array().cloned().unwrap_or_default();
 
