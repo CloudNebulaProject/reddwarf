@@ -72,6 +72,10 @@ impl ApiServer {
                 "/api/v1/namespaces/{namespace}/pods/{name}/status",
                 axum::routing::put(update_pod_status),
             )
+            .route(
+                "/api/v1/namespaces/{namespace}/pods/{name}/finalize",
+                axum::routing::post(finalize_pod),
+            )
             .route("/api/v1/pods", get(list_pods))
             // Nodes
             .route("/api/v1/nodes", get(list_nodes).post(create_node))

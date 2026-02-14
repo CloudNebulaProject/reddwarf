@@ -47,7 +47,7 @@ impl ZoneState {
             ZoneState::Installed => "Pending",
             ZoneState::Ready => "Pending",
             ZoneState::Running => "Running",
-            ZoneState::ShuttingDown => "Succeeded",
+            ZoneState::ShuttingDown => "Terminating",
             ZoneState::Down => "Failed",
             ZoneState::Absent => "Unknown",
         }
@@ -268,7 +268,7 @@ mod tests {
         assert_eq!(ZoneState::Installed.to_pod_phase(), "Pending");
         assert_eq!(ZoneState::Ready.to_pod_phase(), "Pending");
         assert_eq!(ZoneState::Running.to_pod_phase(), "Running");
-        assert_eq!(ZoneState::ShuttingDown.to_pod_phase(), "Succeeded");
+        assert_eq!(ZoneState::ShuttingDown.to_pod_phase(), "Terminating");
         assert_eq!(ZoneState::Down.to_pod_phase(), "Failed");
         assert_eq!(ZoneState::Absent.to_pod_phase(), "Unknown");
     }

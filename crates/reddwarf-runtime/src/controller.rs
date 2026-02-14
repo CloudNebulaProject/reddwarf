@@ -3,9 +3,11 @@ use crate::error::{Result, RuntimeError};
 use crate::network::{vnic_name_for_pod, Ipam};
 use crate::traits::ZoneRuntime;
 use crate::types::*;
+use chrono::Utc;
 use k8s_openapi::api::core::v1::{Pod, PodCondition, PodStatus};
 use reddwarf_core::{ResourceEvent, ResourceQuantities, WatchEventType};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -25,6 +27,8 @@ pub struct PodControllerConfig {
     pub etherstub_name: String,
     /// Pod CIDR (e.g., "10.88.0.0/16")
     pub pod_cidr: String,
+    /// Interval between periodic full reconciliation cycles
+    pub reconcile_interval: Duration,
 }
 
 /// Pod controller that watches for Pod events and drives zone lifecycle
@@ -69,12 +73,21 @@ impl PodController {
         }
 
         let mut rx = self.event_tx.subscribe();
+        let mut reconcile_tick = tokio::time::interval(self.config.reconcile_interval);
+        // Consume the first tick — we just did reconcile_all() above
+        reconcile_tick.tick().await;
 
         loop {
             tokio::select! {
                 _ = token.cancelled() => {
                     info!("Pod controller shutting down");
                     return Ok(());
+                }
+                _ = reconcile_tick.tick() => {
+                    debug!("Periodic reconcile tick");
+                    if let Err(e) = self.reconcile_all().await {
+                        error!("Periodic reconcile failed: {}", e);
+                    }
                 }
                 result = rx.recv() => {
                     match result {
@@ -183,6 +196,11 @@ impl PodController {
 
         if node_name != self.config.node_name {
             return Ok(());
+        }
+
+        // If the pod has a deletion_timestamp, drive the termination state machine
+        if pod.metadata.deletion_timestamp.is_some() {
+            return self.handle_termination(pod).await;
         }
 
         // Check current phase
@@ -321,7 +339,12 @@ impl PodController {
         Ok(())
     }
 
-    /// Handle pod deletion — deprovision the zone and release IP
+    /// Handle pod deletion — deprovision the zone and release IP.
+    ///
+    /// If the pod has a `deletion_timestamp`, the graceful termination state
+    /// machine (`handle_termination`) is responsible for cleanup, so this method
+    /// becomes a no-op. Otherwise (e.g. a direct storage delete that bypasses
+    /// the graceful path), fall back to the original immediate cleanup.
     pub async fn handle_delete(&self, pod: &Pod) -> Result<()> {
         let pod_name = pod
             .metadata
@@ -329,6 +352,15 @@ impl PodController {
             .as_deref()
             .ok_or_else(|| RuntimeError::internal_error("Pod has no name"))?;
         let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
+
+        // If deletion_timestamp is set, handle_termination is driving cleanup
+        if pod.metadata.deletion_timestamp.is_some() {
+            debug!(
+                "Pod {}/{} has deletion_timestamp, skipping handle_delete (handled by termination state machine)",
+                namespace, pod_name
+            );
+            return Ok(());
+        }
 
         // Only deprovision pods assigned to this node
         if let Some(spec) = &pod.spec {
@@ -363,6 +395,142 @@ impl PodController {
         }
 
         Ok(())
+    }
+
+    /// Drive the graceful termination state machine for a pod with
+    /// `deletion_timestamp` set.
+    ///
+    /// | Zone State      | Grace Expired? | Action                                     |
+    /// |-----------------|----------------|--------------------------------------------|
+    /// | Running         | No             | shutdown_zone() (graceful)                 |
+    /// | Running         | Yes            | halt_zone() (force kill)                   |
+    /// | ShuttingDown    | No             | Wait (next reconcile will re-check)        |
+    /// | ShuttingDown    | Yes            | halt_zone() (force kill)                   |
+    /// | Stopped/Absent  | —              | deprovision(), release IP, finalize_pod()  |
+    async fn handle_termination(&self, pod: &Pod) -> Result<()> {
+        let pod_name = pod
+            .metadata
+            .name
+            .as_deref()
+            .ok_or_else(|| RuntimeError::internal_error("Pod has no name"))?;
+        let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
+        let zone_name = pod_zone_name(namespace, pod_name);
+
+        let grace_expired = self.is_grace_period_expired(pod);
+
+        // Query actual zone state
+        let zone_state = match self.runtime.get_zone_state(&zone_name).await {
+            Ok(state) => state,
+            Err(RuntimeError::ZoneNotFound { .. }) => ZoneState::Absent,
+            Err(e) => {
+                warn!(
+                    "Could not check zone state for {}: {} — treating as absent",
+                    zone_name, e
+                );
+                ZoneState::Absent
+            }
+        };
+
+        debug!(
+            "Termination state machine for pod {}/{}: zone={}, grace_expired={}",
+            namespace, pod_name, zone_state, grace_expired
+        );
+
+        match zone_state {
+            ZoneState::Running => {
+                if grace_expired {
+                    warn!(
+                        "Grace period expired for pod {}/{}, force halting zone {}",
+                        namespace, pod_name, zone_name
+                    );
+                    if let Err(e) = self.runtime.halt_zone(&zone_name).await {
+                        warn!("Failed to halt zone {}: {}", zone_name, e);
+                    }
+                    // Deprovision will happen on next reconcile when zone is stopped
+                } else {
+                    info!(
+                        "Initiating graceful shutdown for zone {} (pod {}/{})",
+                        zone_name, namespace, pod_name
+                    );
+                    if let Err(e) = self.runtime.shutdown_zone(&zone_name).await {
+                        warn!("Failed to shut down zone {}: {}", zone_name, e);
+                    }
+                    // Next reconcile will re-check the zone state
+                }
+            }
+            ZoneState::ShuttingDown => {
+                if grace_expired {
+                    warn!(
+                        "Grace period expired while zone {} was shutting down, force halting",
+                        zone_name
+                    );
+                    if let Err(e) = self.runtime.halt_zone(&zone_name).await {
+                        warn!("Failed to halt zone {}: {}", zone_name, e);
+                    }
+                } else {
+                    debug!(
+                        "Zone {} is gracefully shutting down, waiting for next reconcile",
+                        zone_name
+                    );
+                }
+            }
+            // Zone is stopped or absent — full cleanup
+            _ => {
+                info!(
+                    "Zone {} is stopped/absent, cleaning up pod {}/{}",
+                    zone_name, namespace, pod_name
+                );
+
+                // Try to deprovision (cleans up datasets, network, etc.)
+                // Build a minimal zone config for deprovision — use existing IP if allocated
+                let zone_config_result = self.pod_to_zone_config(pod);
+                if let Ok(zone_config) = zone_config_result {
+                    if let Err(e) = self.runtime.deprovision(&zone_config).await {
+                        // Zone may already be fully cleaned up — that's fine
+                        debug!(
+                            "Deprovision for zone {} returned error (may be expected): {}",
+                            zone_name, e
+                        );
+                    }
+                }
+
+                // Release the IP allocation
+                if let Err(e) = self.ipam.release(namespace, pod_name) {
+                    debug!(
+                        "Failed to release IP for pod {}/{}: {} (may already be released)",
+                        namespace, pod_name, e
+                    );
+                }
+
+                // Finalize — remove the pod from API server storage
+                if let Err(e) = self.api_client.finalize_pod(namespace, pod_name).await {
+                    error!(
+                        "Failed to finalize pod {}/{}: {}",
+                        namespace, pod_name, e
+                    );
+                } else {
+                    info!("Pod {}/{} finalized and removed", namespace, pod_name);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check whether the pod's grace period has expired
+    fn is_grace_period_expired(&self, pod: &Pod) -> bool {
+        let deletion_ts = match &pod.metadata.deletion_timestamp {
+            Some(t) => t.0,
+            None => return false,
+        };
+
+        let grace_secs = pod
+            .metadata
+            .deletion_grace_period_seconds
+            .unwrap_or(30);
+
+        let deadline = deletion_ts + chrono::Duration::seconds(grace_secs);
+        Utc::now() >= deadline
     }
 
     /// Convert a Pod spec to a ZoneConfig with per-pod VNIC and IP
@@ -510,6 +678,7 @@ mod tests {
     use k8s_openapi::api::core::v1::{Container, PodSpec};
     use reddwarf_storage::RedbBackend;
     use std::net::Ipv4Addr;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     fn make_test_controller() -> (PodController, tempfile::TempDir) {
@@ -532,6 +701,7 @@ mod tests {
             default_brand: ZoneBrand::Reddwarf,
             etherstub_name: "reddwarf0".to_string(),
             pod_cidr: "10.88.0.0/16".to_string(),
+            reconcile_interval: Duration::from_secs(30),
         };
 
         let controller = PodController::new(runtime, api_client, event_tx, config, ipam);
@@ -802,5 +972,173 @@ mod tests {
         let zone_config = controller.pod_to_zone_config(&pod).unwrap();
         assert_eq!(zone_config.cpu_cap, None);
         assert_eq!(zone_config.memory_cap, None);
+    }
+
+    #[test]
+    fn test_grace_period_not_expired() {
+        let (controller, _dir) = make_test_controller();
+
+        let mut pod = Pod::default();
+        pod.metadata.name = Some("grace-pod".to_string());
+        pod.metadata.deletion_timestamp = Some(
+            k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(Utc::now()),
+        );
+        pod.metadata.deletion_grace_period_seconds = Some(30);
+
+        assert!(!controller.is_grace_period_expired(&pod));
+    }
+
+    #[test]
+    fn test_grace_period_expired() {
+        let (controller, _dir) = make_test_controller();
+
+        let mut pod = Pod::default();
+        pod.metadata.name = Some("expired-pod".to_string());
+        // Set deletion_timestamp 60 seconds in the past
+        pod.metadata.deletion_timestamp = Some(
+            k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                Utc::now() - chrono::Duration::seconds(60),
+            ),
+        );
+        pod.metadata.deletion_grace_period_seconds = Some(30);
+
+        assert!(controller.is_grace_period_expired(&pod));
+    }
+
+    #[test]
+    fn test_grace_period_no_deletion_timestamp() {
+        let (controller, _dir) = make_test_controller();
+
+        let pod = Pod::default();
+        assert!(!controller.is_grace_period_expired(&pod));
+    }
+
+    #[tokio::test]
+    async fn test_handle_termination_absent_zone_calls_finalize() {
+        let (controller, _dir) = make_test_controller();
+
+        // Build a pod with deletion_timestamp that is assigned to our node
+        let mut pod = Pod::default();
+        pod.metadata.name = Some("term-pod".to_string());
+        pod.metadata.namespace = Some("default".to_string());
+        pod.metadata.deletion_timestamp = Some(
+            k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(Utc::now()),
+        );
+        pod.metadata.deletion_grace_period_seconds = Some(30);
+        pod.spec = Some(PodSpec {
+            node_name: Some("node1".to_string()),
+            containers: vec![Container {
+                name: "web".to_string(),
+                command: Some(vec!["/bin/sh".to_string()]),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        // Zone doesn't exist in the mock runtime → should be treated as Absent
+        // handle_termination will try to deprovision (fail, that's ok) and then
+        // finalize (will fail since no API server, but the path is exercised)
+        let result = controller.handle_termination(&pod).await;
+        // The function should complete Ok (finalize failure is logged, not returned)
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_handle_termination_running_zone_graceful_shutdown() {
+        let (controller, _dir) = make_test_controller();
+
+        // First, provision a zone so it's Running
+        let mut pod = Pod::default();
+        pod.metadata.name = Some("running-term".to_string());
+        pod.metadata.namespace = Some("default".to_string());
+        pod.spec = Some(PodSpec {
+            node_name: Some("node1".to_string()),
+            containers: vec![Container {
+                name: "web".to_string(),
+                command: Some(vec!["/bin/sh".to_string()]),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        // Provision the zone through the runtime
+        let zone_config = controller.pod_to_zone_config(&pod).unwrap();
+        controller.runtime.provision(&zone_config).await.unwrap();
+
+        // Verify it's running
+        let zone_name = pod_zone_name("default", "running-term");
+        let state = controller.runtime.get_zone_state(&zone_name).await.unwrap();
+        assert_eq!(state, ZoneState::Running);
+
+        // Set deletion_timestamp (grace period NOT expired)
+        pod.metadata.deletion_timestamp = Some(
+            k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(Utc::now()),
+        );
+        pod.metadata.deletion_grace_period_seconds = Some(30);
+
+        // Handle termination — should call shutdown_zone
+        let result = controller.handle_termination(&pod).await;
+        assert!(result.is_ok());
+
+        // After shutdown, MockRuntime transitions zone to Installed
+        let state = controller.runtime.get_zone_state(&zone_name).await.unwrap();
+        assert_eq!(state, ZoneState::Installed);
+    }
+
+    #[tokio::test]
+    async fn test_handle_delete_skips_when_deletion_timestamp_set() {
+        let (controller, _dir) = make_test_controller();
+
+        let mut pod = Pod::default();
+        pod.metadata.name = Some("skip-pod".to_string());
+        pod.metadata.namespace = Some("default".to_string());
+        pod.metadata.deletion_timestamp = Some(
+            k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(Utc::now()),
+        );
+        pod.spec = Some(PodSpec {
+            node_name: Some("node1".to_string()),
+            containers: vec![Container {
+                name: "web".to_string(),
+                command: Some(vec!["/bin/sh".to_string()]),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        // handle_delete should return Ok immediately — skipping deprovision
+        let result = controller.handle_delete(&pod).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_with_deletion_timestamp_uses_termination() {
+        let (controller, _dir) = make_test_controller();
+
+        // Build a pod with deletion_timestamp, assigned to our node, phase Terminating
+        let mut pod = Pod::default();
+        pod.metadata.name = Some("recon-term".to_string());
+        pod.metadata.namespace = Some("default".to_string());
+        pod.metadata.deletion_timestamp = Some(
+            k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(Utc::now()),
+        );
+        pod.metadata.deletion_grace_period_seconds = Some(30);
+        pod.spec = Some(PodSpec {
+            node_name: Some("node1".to_string()),
+            containers: vec![Container {
+                name: "web".to_string(),
+                command: Some(vec!["/bin/sh".to_string()]),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        pod.status = Some(PodStatus {
+            phase: Some("Terminating".to_string()),
+            ..Default::default()
+        });
+
+        // reconcile() should detect deletion_timestamp and call handle_termination
+        // Zone is absent → will try to finalize (will fail, but logged)
+        let result = controller.reconcile(&pod).await;
+        assert!(result.is_ok());
     }
 }

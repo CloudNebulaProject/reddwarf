@@ -11,6 +11,7 @@ pub mod illumos;
 pub mod mock;
 pub mod network;
 pub mod node_agent;
+pub mod node_health;
 pub mod storage;
 pub mod traits;
 pub mod types;
@@ -35,6 +36,7 @@ pub use storage::{MockStorageEngine, StorageEngine, VolumeInfo};
 pub use api_client::ApiClient;
 pub use controller::{PodController, PodControllerConfig};
 pub use node_agent::{NodeAgent, NodeAgentConfig};
+pub use node_health::{NodeHealthChecker, NodeHealthCheckerConfig};
 
 // Conditionally re-export illumos runtime
 #[cfg(target_os = "illumos")]

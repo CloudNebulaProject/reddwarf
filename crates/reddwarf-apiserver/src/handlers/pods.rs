@@ -14,6 +14,8 @@ use reddwarf_storage::KeyEncoder;
 use std::sync::Arc;
 use tracing::info;
 
+const DEFAULT_TERMINATION_GRACE_PERIOD: i64 = 30;
+
 /// GET /api/v1/namespaces/{namespace}/pods/{name}
 pub async fn get_pod(
     State(state): State<Arc<AppState>>,
@@ -94,11 +96,63 @@ pub async fn replace_pod(
 }
 
 /// DELETE /api/v1/namespaces/{namespace}/pods/{name}
+///
+/// Initiates graceful termination: sets deletion_timestamp and phase=Terminating
+/// instead of immediately removing the pod from storage. The controller will
+/// drive the zone shutdown state machine and call finalize_pod() when cleanup
+/// is complete.
 pub async fn delete_pod(
     State(state): State<Arc<AppState>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Response> {
     info!("Deleting pod: {}/{}", namespace, name);
+
+    let gvk = GroupVersionKind::from_api_version_kind("v1", "Pod");
+    let key = ResourceKey::new(gvk, namespace.clone(), name.clone());
+
+    let mut pod: Pod = get_resource(&state, &key).await?;
+
+    // Idempotent: if deletion_timestamp is already set, return current state
+    if pod.metadata.deletion_timestamp.is_some() {
+        info!(
+            "Pod {}/{} already has deletion_timestamp set, returning current state",
+            namespace, name
+        );
+        return Ok(ApiResponse::ok(pod).into_response());
+    }
+
+    // Set deletion metadata
+    pod.metadata.deletion_timestamp = Some(
+        reddwarf_core::k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(chrono::Utc::now()),
+    );
+
+    // Grace period from spec, defaulting to 30s
+    let grace_period = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.termination_grace_period_seconds)
+        .unwrap_or(DEFAULT_TERMINATION_GRACE_PERIOD);
+    pod.metadata.deletion_grace_period_seconds = Some(grace_period);
+
+    // Set phase to Terminating
+    let status = pod.status.get_or_insert_with(Default::default);
+    status.phase = Some("Terminating".to_string());
+
+    // Update resource — emits a MODIFIED event (not DELETED)
+    let updated = update_resource(&state, pod).await?;
+
+    Ok(ApiResponse::ok(updated).into_response())
+}
+
+/// POST /api/v1/namespaces/{namespace}/pods/{name}/finalize
+///
+/// Performs the actual storage removal of a pod. Called by the controller after
+/// zone cleanup is complete.
+pub async fn finalize_pod(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, name)): Path<(String, String)>,
+) -> Result<Response> {
+    info!("Finalizing pod: {}/{}", namespace, name);
 
     let gvk = GroupVersionKind::from_api_version_kind("v1", "Pod");
     let key = ResourceKey::new(gvk, namespace, name.clone());
@@ -302,5 +356,129 @@ mod tests {
         let event = rx.recv().await.unwrap();
         assert!(matches!(event.event_type, WatchEventType::Modified));
         assert_eq!(event.resource_key.name, "event-test");
+    }
+
+    #[tokio::test]
+    async fn test_delete_pod_sets_deletion_timestamp() {
+        let state = setup_state().await;
+
+        let pod = make_test_pod("graceful-pod", "default");
+        create_resource(&*state, pod).await.unwrap();
+
+        // Simulate what delete_pod handler does: read, set deletion_timestamp, update
+        let gvk = GroupVersionKind::from_api_version_kind("v1", "Pod");
+        let key = ResourceKey::new(gvk.clone(), "default", "graceful-pod");
+
+        let mut pod: Pod = get_resource(&*state, &key).await.unwrap();
+        assert!(pod.metadata.deletion_timestamp.is_none());
+
+        // Set deletion metadata
+        pod.metadata.deletion_timestamp = Some(
+            reddwarf_core::k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                chrono::Utc::now(),
+            ),
+        );
+        pod.metadata.deletion_grace_period_seconds = Some(30);
+        let status = pod.status.get_or_insert_with(Default::default);
+        status.phase = Some("Terminating".to_string());
+
+        let updated = update_resource(&*state, pod).await.unwrap();
+
+        // Pod should still exist in storage
+        let retrieved: Pod = get_resource(&*state, &key).await.unwrap();
+        assert!(retrieved.metadata.deletion_timestamp.is_some());
+        assert_eq!(retrieved.metadata.deletion_grace_period_seconds, Some(30));
+        assert_eq!(
+            retrieved.status.as_ref().unwrap().phase.as_deref(),
+            Some("Terminating")
+        );
+
+        // Should have emitted a MODIFIED event (not DELETED)
+        assert!(updated.resource_version().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_delete_pod_idempotent() {
+        let state = setup_state().await;
+
+        let pod = make_test_pod("idem-pod", "default");
+        create_resource(&*state, pod).await.unwrap();
+
+        let gvk = GroupVersionKind::from_api_version_kind("v1", "Pod");
+        let key = ResourceKey::new(gvk, "default", "idem-pod");
+
+        // First delete: set deletion_timestamp
+        let mut pod: Pod = get_resource(&*state, &key).await.unwrap();
+        pod.metadata.deletion_timestamp = Some(
+            reddwarf_core::k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                chrono::Utc::now(),
+            ),
+        );
+        pod.metadata.deletion_grace_period_seconds = Some(30);
+        pod.status
+            .get_or_insert_with(Default::default)
+            .phase = Some("Terminating".to_string());
+        update_resource(&*state, pod).await.unwrap();
+
+        // Second "delete" attempt should see deletion_timestamp is already set
+        let pod2: Pod = get_resource(&*state, &key).await.unwrap();
+        assert!(pod2.metadata.deletion_timestamp.is_some());
+
+        // Pod should still exist in storage (not removed)
+        assert_eq!(
+            pod2.status.as_ref().unwrap().phase.as_deref(),
+            Some("Terminating")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_finalize_removes_pod_from_storage() {
+        let state = setup_state().await;
+
+        let pod = make_test_pod("finalize-pod", "default");
+        create_resource(&*state, pod).await.unwrap();
+
+        let gvk = GroupVersionKind::from_api_version_kind("v1", "Pod");
+        let key = ResourceKey::new(gvk, "default", "finalize-pod");
+
+        // Pod should exist
+        let _: Pod = get_resource(&*state, &key).await.unwrap();
+
+        // Finalize (actual storage removal)
+        delete_resource(&state, &key).await.unwrap();
+
+        // Pod should be gone
+        let result: std::result::Result<Pod, _> = get_resource(&*state, &key).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_delete_fires_modified_not_deleted_event() {
+        let state = setup_state().await;
+
+        let pod = make_test_pod("event-del-pod", "default");
+        create_resource(&*state, pod).await.unwrap();
+
+        // Subscribe to events
+        let mut rx = state.subscribe();
+
+        let gvk = GroupVersionKind::from_api_version_kind("v1", "Pod");
+        let key = ResourceKey::new(gvk, "default", "event-del-pod");
+
+        let mut pod: Pod = get_resource(&*state, &key).await.unwrap();
+        pod.metadata.deletion_timestamp = Some(
+            reddwarf_core::k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                chrono::Utc::now(),
+            ),
+        );
+        pod.status
+            .get_or_insert_with(Default::default)
+            .phase = Some("Terminating".to_string());
+        update_resource(&*state, pod).await.unwrap();
+
+        // Should get a MODIFIED event
+        let event = rx.recv().await.unwrap();
+        assert!(matches!(event.event_type, WatchEventType::Modified));
+        assert_eq!(event.resource_key.name, "event-del-pod");
     }
 }

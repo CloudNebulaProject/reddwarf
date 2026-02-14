@@ -2,8 +2,9 @@ use clap::{Parser, Subcommand};
 use reddwarf_apiserver::{ApiError, ApiServer, AppState, Config as ApiConfig, TlsMode};
 use reddwarf_core::Namespace;
 use reddwarf_runtime::{
-    ApiClient, Ipam, MockRuntime, MockStorageEngine, NodeAgent, NodeAgentConfig, PodController,
-    PodControllerConfig, StorageEngine, StoragePoolConfig, ZoneBrand,
+    ApiClient, Ipam, MockRuntime, MockStorageEngine, NodeAgent, NodeAgentConfig,
+    NodeHealthChecker, NodeHealthCheckerConfig, PodController, PodControllerConfig, StorageEngine,
+    StoragePoolConfig, ZoneBrand,
 };
 use reddwarf_scheduler::scheduler::SchedulerConfig;
 use reddwarf_scheduler::Scheduler;
@@ -318,6 +319,7 @@ async fn run_agent(
         default_brand: ZoneBrand::Reddwarf,
         etherstub_name: etherstub_name.to_string(),
         pod_cidr: pod_cidr.to_string(),
+        reconcile_interval: std::time::Duration::from_secs(30),
     };
 
     let controller = PodController::new(
@@ -336,11 +338,20 @@ async fn run_agent(
 
     // 6. Spawn node agent
     let node_agent_config = NodeAgentConfig::new(node_name.to_string(), api_url);
-    let node_agent = NodeAgent::new(api_client, node_agent_config);
+    let node_agent = NodeAgent::new(api_client.clone(), node_agent_config);
     let agent_token = token.clone();
     let node_agent_handle = tokio::spawn(async move {
         if let Err(e) = node_agent.run(agent_token).await {
             error!("Node agent error: {}", e);
+        }
+    });
+
+    // 7. Spawn node health checker
+    let health_checker = NodeHealthChecker::new(api_client, NodeHealthCheckerConfig::default());
+    let health_token = token.clone();
+    let health_handle = tokio::spawn(async move {
+        if let Err(e) = health_checker.run(health_token).await {
+            error!("Node health checker error: {}", e);
         }
     });
 
@@ -362,6 +373,7 @@ async fn run_agent(
             scheduler_handle,
             controller_handle,
             node_agent_handle,
+            health_handle,
         );
     })
     .await;

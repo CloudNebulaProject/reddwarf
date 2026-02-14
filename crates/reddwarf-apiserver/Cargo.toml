@@ -25,6 +25,7 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 tokio-stream = { workspace = true }
 futures-util = { workspace = true }
+chrono = { workspace = true }
 json-patch = "3.0"
 rcgen = { workspace = true }
 rustls = { workspace = true }

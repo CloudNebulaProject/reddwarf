@@ -227,6 +227,36 @@ impl ApiClient {
             .map_err(|e| RuntimeError::internal_error(format!("Failed to parse node: {}", e)))
     }
 
+    /// POST /api/v1/namespaces/{namespace}/pods/{name}/finalize
+    ///
+    /// Called by the controller after zone cleanup is complete to remove the pod
+    /// from API server storage.
+    pub async fn finalize_pod(&self, namespace: &str, name: &str) -> Result<()> {
+        let url = format!(
+            "{}/api/v1/namespaces/{}/pods/{}/finalize",
+            self.base_url, namespace, name
+        );
+        debug!("POST {}", url);
+
+        let resp = self
+            .client
+            .post(&url)
+            .send()
+            .await
+            .map_err(|e| RuntimeError::internal_error(format!("HTTP request failed: {}", e)))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(RuntimeError::internal_error(format!(
+                "POST finalize pod failed with status {}: {}",
+                status, body
+            )));
+        }
+
+        Ok(())
+    }
+
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
