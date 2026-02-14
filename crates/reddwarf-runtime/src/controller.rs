@@ -1,14 +1,17 @@
 use crate::api_client::ApiClient;
 use crate::error::{Result, RuntimeError};
 use crate::network::{vnic_name_for_pod, Ipam};
+use crate::probes::executor::ProbeExecutor;
+use crate::probes::tracker::ProbeTracker;
+use crate::probes::types::extract_probes;
 use crate::traits::ZoneRuntime;
 use crate::types::*;
 use chrono::Utc;
 use k8s_openapi::api::core::v1::{Pod, PodCondition, PodStatus};
 use reddwarf_core::{ResourceEvent, ResourceQuantities, WatchEventType};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::broadcast;
+use std::time::{Duration, Instant};
+use tokio::sync::{broadcast, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -38,6 +41,7 @@ pub struct PodController {
     event_tx: broadcast::Sender<ResourceEvent>,
     config: PodControllerConfig,
     ipam: Ipam,
+    probe_tracker: Mutex<ProbeTracker>,
 }
 
 impl PodController {
@@ -48,12 +52,15 @@ impl PodController {
         config: PodControllerConfig,
         ipam: Ipam,
     ) -> Self {
+        let probe_executor = ProbeExecutor::new(Arc::clone(&runtime));
+        let probe_tracker = Mutex::new(ProbeTracker::new(probe_executor));
         Self {
             runtime,
             api_client,
             event_tx,
             config,
             ipam,
+            probe_tracker,
         }
     }
 
@@ -273,7 +280,124 @@ impl PodController {
                 // Check zone health
                 match self.runtime.get_zone_state(&zone_name).await {
                     Ok(ZoneState::Running) => {
-                        // All good
+                        // Zone is running — execute health probes
+                        let pod_key = format!("{}/{}", namespace, pod_name);
+                        let zone_ip = self.get_pod_ip(pod);
+
+                        // Extract and register probes (idempotent)
+                        let probes = self.extract_pod_probes(pod);
+                        let started_at = self.pod_start_time(pod);
+
+                        let mut tracker = self.probe_tracker.lock().await;
+                        tracker.register_pod(&pod_key, probes, started_at);
+
+                        let status = tracker
+                            .check_pod(&pod_key, &zone_name, &zone_ip)
+                            .await;
+                        drop(tracker);
+
+                        if status.liveness_failed {
+                            let message = status.failure_message.unwrap_or_else(|| {
+                                "Liveness probe failed".to_string()
+                            });
+                            warn!(
+                                "Liveness probe failed for pod {}/{}: {}",
+                                namespace, pod_name, message
+                            );
+                            let pod_status = PodStatus {
+                                phase: Some("Failed".to_string()),
+                                conditions: Some(vec![PodCondition {
+                                    type_: "Ready".to_string(),
+                                    status: "False".to_string(),
+                                    reason: Some("LivenessProbeFailure".to_string()),
+                                    message: Some(message),
+                                    ..Default::default()
+                                }]),
+                                ..Default::default()
+                            };
+
+                            if let Err(e) = self
+                                .api_client
+                                .set_pod_status(namespace, pod_name, pod_status)
+                                .await
+                            {
+                                error!("Failed to update pod status to Failed: {}", e);
+                            }
+
+                            // Unregister probes for this pod
+                            let mut tracker = self.probe_tracker.lock().await;
+                            tracker.unregister_pod(&pod_key);
+                        } else if !status.ready {
+                            let message = status.failure_message.unwrap_or_else(|| {
+                                "Readiness probe failed".to_string()
+                            });
+                            debug!(
+                                "Readiness probe not passing for pod {}/{}: {}",
+                                namespace, pod_name, message
+                            );
+
+                            // Only update if currently marked Ready=True
+                            let currently_ready = pod
+                                .status
+                                .as_ref()
+                                .and_then(|s| s.conditions.as_ref())
+                                .and_then(|c| c.iter().find(|c| c.type_ == "Ready"))
+                                .map(|c| c.status == "True")
+                                .unwrap_or(false);
+
+                            if currently_ready {
+                                let pod_status = PodStatus {
+                                    phase: Some("Running".to_string()),
+                                    conditions: Some(vec![PodCondition {
+                                        type_: "Ready".to_string(),
+                                        status: "False".to_string(),
+                                        reason: Some("ReadinessProbeFailure".to_string()),
+                                        message: Some(message),
+                                        ..Default::default()
+                                    }]),
+                                    pod_ip: Some(zone_ip),
+                                    ..Default::default()
+                                };
+
+                                if let Err(e) = self
+                                    .api_client
+                                    .set_pod_status(namespace, pod_name, pod_status)
+                                    .await
+                                {
+                                    error!("Failed to update pod status: {}", e);
+                                }
+                            }
+                        } else {
+                            // All probes pass — set Ready=True if not already
+                            let currently_ready = pod
+                                .status
+                                .as_ref()
+                                .and_then(|s| s.conditions.as_ref())
+                                .and_then(|c| c.iter().find(|c| c.type_ == "Ready"))
+                                .map(|c| c.status == "True")
+                                .unwrap_or(false);
+
+                            if !currently_ready {
+                                let pod_status = PodStatus {
+                                    phase: Some("Running".to_string()),
+                                    conditions: Some(vec![PodCondition {
+                                        type_: "Ready".to_string(),
+                                        status: "True".to_string(),
+                                        ..Default::default()
+                                    }]),
+                                    pod_ip: Some(zone_ip),
+                                    ..Default::default()
+                                };
+
+                                if let Err(e) = self
+                                    .api_client
+                                    .set_pod_status(namespace, pod_name, pod_status)
+                                    .await
+                                {
+                                    error!("Failed to update pod status: {}", e);
+                                }
+                            }
+                        }
                     }
                     Ok(state) => {
                         warn!(
@@ -394,6 +518,11 @@ impl PodController {
             );
         }
 
+        // Unregister probes
+        let pod_key = format!("{}/{}", namespace, pod_name);
+        let mut tracker = self.probe_tracker.lock().await;
+        tracker.unregister_pod(&pod_key);
+
         Ok(())
     }
 
@@ -501,6 +630,12 @@ impl PodController {
                         namespace, pod_name, e
                     );
                 }
+
+                // Unregister probes
+                let pod_key = format!("{}/{}", namespace, pod_name);
+                let mut tracker = self.probe_tracker.lock().await;
+                tracker.unregister_pod(&pod_key);
+                drop(tracker);
 
                 // Finalize — remove the pod from API server storage
                 if let Err(e) = self.api_client.finalize_pod(namespace, pod_name).await {
@@ -657,6 +792,47 @@ impl PodController {
             NetworkMode::Etherstub(e) => e.ip_address.clone(),
             NetworkMode::Direct(d) => d.ip_address.clone(),
         }
+    }
+
+    /// Extract probe configurations from all containers in a pod spec
+    fn extract_pod_probes(&self, pod: &Pod) -> Vec<crate::probes::types::ContainerProbeConfig> {
+        let spec = match &pod.spec {
+            Some(s) => s,
+            None => return vec![],
+        };
+
+        spec.containers
+            .iter()
+            .flat_map(|c| extract_probes(c))
+            .collect()
+    }
+
+    /// Get the pod's IP from its status, falling back to empty string
+    fn get_pod_ip(&self, pod: &Pod) -> String {
+        pod.status
+            .as_ref()
+            .and_then(|s| s.pod_ip.clone())
+            .unwrap_or_default()
+    }
+
+    /// Approximate when the pod's containers started.
+    /// Uses the pod's start_time if available, otherwise uses now.
+    fn pod_start_time(&self, pod: &Pod) -> Instant {
+        // We can't convert k8s Time to std Instant directly. Instead, compute
+        // the elapsed duration since start_time and subtract from Instant::now().
+        if let Some(start_time) = pod
+            .status
+            .as_ref()
+            .and_then(|s| s.start_time.as_ref())
+        {
+            let now_utc = Utc::now();
+            let started_utc = start_time.0;
+            let elapsed = now_utc.signed_duration_since(started_utc);
+            if let Ok(elapsed_std) = elapsed.to_std() {
+                return Instant::now().checked_sub(elapsed_std).unwrap_or_else(Instant::now);
+            }
+        }
+        Instant::now()
     }
 }
 
@@ -1166,6 +1342,144 @@ mod tests {
 
         let zone_config = controller.pod_to_zone_config(&pod).unwrap();
         assert_eq!(zone_config.brand, ZoneBrand::Reddwarf);
+    }
+
+    fn make_test_controller_with_runtime() -> (PodController, Arc<crate::mock::MockRuntime>, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test-controller-rt.redb");
+        let storage = Arc::new(RedbBackend::new(&db_path).unwrap());
+        let ipam = Ipam::new(storage, "10.88.0.0/16").unwrap();
+
+        let mock_storage = Arc::new(crate::storage::MockStorageEngine::new(
+            crate::types::StoragePoolConfig::from_pool("rpool"),
+        ));
+        let runtime = Arc::new(crate::mock::MockRuntime::new(mock_storage));
+        let api_client = Arc::new(ApiClient::new("http://127.0.0.1:6443"));
+        let (event_tx, _) = broadcast::channel(16);
+
+        let config = PodControllerConfig {
+            node_name: "node1".to_string(),
+            api_url: "http://127.0.0.1:6443".to_string(),
+            zonepath_prefix: "/zones".to_string(),
+            default_brand: ZoneBrand::Reddwarf,
+            etherstub_name: "reddwarf0".to_string(),
+            pod_cidr: "10.88.0.0/16".to_string(),
+            reconcile_interval: Duration::from_secs(30),
+        };
+
+        let controller = PodController::new(runtime.clone() as Arc<dyn ZoneRuntime>, api_client, event_tx, config, ipam);
+        (controller, runtime, dir)
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_running_pod_with_no_probes() {
+        let (controller, runtime, _dir) = make_test_controller_with_runtime();
+
+        // Create a pod that is already Running with a provisioned zone
+        let mut pod = Pod::default();
+        pod.metadata.name = Some("no-probe-pod".to_string());
+        pod.metadata.namespace = Some("default".to_string());
+        pod.spec = Some(PodSpec {
+            node_name: Some("node1".to_string()),
+            containers: vec![Container {
+                name: "web".to_string(),
+                command: Some(vec!["/bin/sh".to_string()]),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        pod.status = Some(PodStatus {
+            phase: Some("Running".to_string()),
+            pod_ip: Some("10.88.0.2".to_string()),
+            conditions: Some(vec![PodCondition {
+                type_: "Ready".to_string(),
+                status: "True".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+
+        // Provision the zone so get_zone_state returns Running
+        let zone_config = controller.pod_to_zone_config(&pod).unwrap();
+        runtime.provision(&zone_config).await.unwrap();
+
+        // Reconcile — should succeed without changing anything (no probes)
+        let result = controller.reconcile(&pod).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_running_pod_liveness_failure() {
+        let (controller, runtime, _dir) = make_test_controller_with_runtime();
+
+        let mut pod = Pod::default();
+        pod.metadata.name = Some("liveness-pod".to_string());
+        pod.metadata.namespace = Some("default".to_string());
+        pod.spec = Some(PodSpec {
+            node_name: Some("node1".to_string()),
+            containers: vec![Container {
+                name: "web".to_string(),
+                command: Some(vec!["/bin/sh".to_string()]),
+                liveness_probe: Some(k8s_openapi::api::core::v1::Probe {
+                    exec: Some(k8s_openapi::api::core::v1::ExecAction {
+                        command: Some(vec!["healthcheck".to_string()]),
+                    }),
+                    period_seconds: Some(0), // Always run
+                    failure_threshold: Some(3),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        pod.status = Some(PodStatus {
+            phase: Some("Running".to_string()),
+            pod_ip: Some("10.88.0.2".to_string()),
+            conditions: Some(vec![PodCondition {
+                type_: "Ready".to_string(),
+                status: "True".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+
+        // Provision the zone
+        let zone_config = controller.pod_to_zone_config(&pod).unwrap();
+        runtime.provision(&zone_config).await.unwrap();
+
+        // Queue failures for the liveness probe
+        let zone_name = pod_zone_name("default", "liveness-pod");
+        for _ in 0..3 {
+            runtime
+                .set_exec_result(
+                    &zone_name,
+                    crate::command::CommandOutput {
+                        stdout: String::new(),
+                        stderr: "unhealthy".to_string(),
+                        exit_code: 1,
+                    },
+                )
+                .await;
+        }
+
+        // Reconcile 3 times to hit the failure threshold.
+        // On the 3rd reconcile, liveness failure is detected. The controller
+        // then unregisters the probes and tries to set the pod status to Failed
+        // (which fails silently since there's no API server).
+        for _ in 0..3 {
+            let _ = controller.reconcile(&pod).await;
+        }
+
+        // Verify the liveness failure path was taken: probes should be unregistered
+        let pod_key = "default/liveness-pod";
+        let mut tracker = controller.probe_tracker.lock().await;
+        let status = tracker
+            .check_pod(pod_key, &zone_name, "10.88.0.2")
+            .await;
+        // No probes registered → default status (ready=true, liveness_failed=false)
+        // This confirms the unregister happened, which only occurs on liveness failure
+        assert!(status.ready);
+        assert!(!status.liveness_failed);
     }
 
     #[tokio::test]

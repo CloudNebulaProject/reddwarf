@@ -1,5 +1,5 @@
 use crate::brand::lx::lx_install_args;
-use crate::command::exec;
+use crate::command::{exec, CommandOutput};
 use crate::error::Result;
 use crate::storage::StorageEngine;
 use crate::traits::ZoneRuntime;
@@ -89,6 +89,13 @@ impl ZoneRuntime for IllumosRuntime {
         exec("zonecfg", &["-z", zone_name, "delete", "-F"]).await?;
         info!("Zone deleted: {}", zone_name);
         Ok(())
+    }
+
+    async fn exec_in_zone(&self, zone_name: &str, command: &[String]) -> Result<CommandOutput> {
+        let mut args: Vec<&str> = vec![zone_name];
+        let str_refs: Vec<&str> = command.iter().map(|s| s.as_str()).collect();
+        args.extend(str_refs);
+        crate::command::exec_unchecked("zlogin", &args).await
     }
 
     async fn get_zone_state(&self, zone_name: &str) -> Result<ZoneState> {

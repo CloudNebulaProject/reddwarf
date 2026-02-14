@@ -46,6 +46,19 @@ pub trait ZoneRuntime: Send + Sync {
     /// List all managed zones
     async fn list_zones(&self) -> Result<Vec<ZoneInfo>>;
 
+    // --- Exec ---
+
+    /// Execute a command inside a running zone
+    ///
+    /// Returns the command output including exit code. A non-zero exit code
+    /// is NOT treated as an error — callers (e.g. probe executors) interpret
+    /// the exit code themselves.
+    async fn exec_in_zone(
+        &self,
+        zone_name: &str,
+        command: &[String],
+    ) -> Result<crate::command::CommandOutput>;
+
     // --- Networking ---
 
     /// Set up network for a zone

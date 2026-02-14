@@ -1,9 +1,10 @@
+use crate::command::CommandOutput;
 use crate::error::{Result, RuntimeError};
 use crate::storage::StorageEngine;
 use crate::traits::ZoneRuntime;
 use crate::types::*;
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::debug;
@@ -25,6 +26,7 @@ pub struct MockRuntime {
     zones: Arc<RwLock<HashMap<String, MockZone>>>,
     next_id: Arc<RwLock<i32>>,
     storage: Arc<dyn StorageEngine>,
+    exec_results: Arc<RwLock<HashMap<String, VecDeque<CommandOutput>>>>,
 }
 
 impl MockRuntime {
@@ -33,7 +35,18 @@ impl MockRuntime {
             zones: Arc::new(RwLock::new(HashMap::new())),
             next_id: Arc::new(RwLock::new(1)),
             storage,
+            exec_results: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Queue a custom exec result for a specific zone.
+    /// Results are consumed in FIFO order. Once exhausted, falls back to defaults.
+    pub async fn set_exec_result(&self, zone_name: &str, output: CommandOutput) {
+        let mut results = self.exec_results.write().await;
+        results
+            .entry(zone_name.to_string())
+            .or_default()
+            .push_back(output);
     }
 }
 
@@ -181,6 +194,40 @@ impl ZoneRuntime for MockRuntime {
         Ok(())
     }
 
+    async fn exec_in_zone(&self, zone_name: &str, _command: &[String]) -> Result<CommandOutput> {
+        // Check for queued custom results first
+        {
+            let mut results = self.exec_results.write().await;
+            if let Some(queue) = results.get_mut(zone_name) {
+                if let Some(output) = queue.pop_front() {
+                    return Ok(output);
+                }
+            }
+        }
+
+        // Default behavior: succeed if zone is Running, error otherwise
+        let zones = self.zones.read().await;
+        let zone = zones
+            .get(zone_name)
+            .ok_or_else(|| RuntimeError::zone_not_found(zone_name))?;
+
+        if zone.state == ZoneState::Running {
+            Ok(CommandOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+            })
+        } else {
+            Err(RuntimeError::zone_operation_failed(
+                zone_name,
+                format!(
+                    "Cannot exec in zone: zone is in state {} (expected Running)",
+                    zone.state
+                ),
+            ))
+        }
+    }
+
     async fn get_zone_state(&self, zone_name: &str) -> Result<ZoneState> {
         let zones = self.zones.read().await;
         let zone = zones
@@ -314,6 +361,77 @@ mod tests {
             memory_cap: None,
             fs_mounts: vec![],
         }
+    }
+
+    #[tokio::test]
+    async fn test_exec_in_zone_running_default_success() {
+        let rt = MockRuntime::new(make_test_storage());
+        let config = make_test_config("exec-zone");
+        rt.provision(&config).await.unwrap();
+
+        let output = rt
+            .exec_in_zone("exec-zone", &["echo".to_string(), "hello".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(output.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn test_exec_in_zone_not_running_errors() {
+        let rt = MockRuntime::new(make_test_storage());
+        let config = make_test_config("stopped-zone");
+        rt.create_zone(&config).await.unwrap();
+        rt.install_zone("stopped-zone").await.unwrap();
+        // Zone is Installed, not Running
+
+        let result = rt
+            .exec_in_zone("stopped-zone", &["echo".to_string()])
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_exec_in_zone_not_found_errors() {
+        let rt = MockRuntime::new(make_test_storage());
+
+        let result = rt
+            .exec_in_zone("nonexistent", &["echo".to_string()])
+            .await;
+        assert!(matches!(
+            result.unwrap_err(),
+            RuntimeError::ZoneNotFound { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_exec_in_zone_custom_result() {
+        let rt = MockRuntime::new(make_test_storage());
+        let config = make_test_config("custom-zone");
+        rt.provision(&config).await.unwrap();
+
+        rt.set_exec_result(
+            "custom-zone",
+            crate::command::CommandOutput {
+                stdout: String::new(),
+                stderr: "probe failed".to_string(),
+                exit_code: 1,
+            },
+        )
+        .await;
+
+        let output = rt
+            .exec_in_zone("custom-zone", &["check".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(output.exit_code, 1);
+        assert_eq!(output.stderr, "probe failed");
+
+        // Second call falls back to default (success)
+        let output2 = rt
+            .exec_in_zone("custom-zone", &["check".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(output2.exit_code, 0);
     }
 
     #[tokio::test]

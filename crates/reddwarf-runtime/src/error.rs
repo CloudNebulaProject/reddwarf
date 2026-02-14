@@ -155,6 +155,25 @@ pub enum RuntimeError {
         message: String,
     },
 
+    /// Health probe failed
+    #[error("Health probe failed for container '{container_name}' in zone '{zone_name}': {message}")]
+    #[diagnostic(
+        code(reddwarf::runtime::probe_failed),
+        help("Check that the probe target is reachable inside the zone. Failure count: {failure_count}/{failure_threshold}. Verify the application is running and the probe command/port/path is correct")
+    )]
+    ProbeFailed {
+        #[allow(unused)]
+        zone_name: String,
+        #[allow(unused)]
+        container_name: String,
+        #[allow(unused)]
+        message: String,
+        #[allow(unused)]
+        failure_count: u32,
+        #[allow(unused)]
+        failure_threshold: u32,
+    },
+
     /// Internal error
     #[error("Internal runtime error: {message}")]
     #[diagnostic(
@@ -238,6 +257,22 @@ impl RuntimeError {
     pub fn resource_detection_failed(message: impl Into<String>) -> Self {
         Self::ResourceDetectionFailed {
             message: message.into(),
+        }
+    }
+
+    pub fn probe_failed(
+        zone_name: impl Into<String>,
+        container_name: impl Into<String>,
+        message: impl Into<String>,
+        failure_count: u32,
+        failure_threshold: u32,
+    ) -> Self {
+        Self::ProbeFailed {
+            zone_name: zone_name.into(),
+            container_name: container_name.into(),
+            message: message.into(),
+            failure_count,
+            failure_threshold,
         }
     }
 

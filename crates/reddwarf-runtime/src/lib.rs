@@ -11,6 +11,7 @@ pub mod illumos;
 pub mod mock;
 pub mod network;
 pub mod node_agent;
+pub mod probes;
 pub mod node_health;
 pub mod storage;
 pub mod sysinfo;
@@ -38,6 +39,7 @@ pub use api_client::ApiClient;
 pub use controller::{PodController, PodControllerConfig};
 pub use node_agent::{NodeAgent, NodeAgentConfig};
 pub use node_health::{NodeHealthChecker, NodeHealthCheckerConfig};
+pub use probes::{ProbeExecutor, ProbeTracker};
 
 // Conditionally re-export illumos runtime
 #[cfg(target_os = "illumos")]
