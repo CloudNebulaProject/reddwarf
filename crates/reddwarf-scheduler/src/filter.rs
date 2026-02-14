@@ -220,9 +220,65 @@ impl FilterPredicate for TaintToleration {
     }
 }
 
+/// Filter for zone brand compatibility between pod and node
+pub struct ZoneBrandMatch;
+
+impl FilterPredicate for ZoneBrandMatch {
+    fn filter(&self, context: &SchedulingContext, node: &Node) -> FilterResult {
+        let node_name = node
+            .metadata
+            .name
+            .as_ref()
+            .unwrap_or(&"unknown".to_string())
+            .clone();
+
+        // Read pod annotation "reddwarf.io/zone-brand" (default: "reddwarf")
+        let pod_brand = context
+            .pod
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get("reddwarf.io/zone-brand"))
+            .map(|s| s.as_str())
+            .unwrap_or("reddwarf");
+
+        // Read node label "reddwarf.io/zone-brands" — if absent, pass (backward compat)
+        let node_brands_label = node
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get("reddwarf.io/zone-brands"));
+
+        let node_brands_label = match node_brands_label {
+            Some(label) => label,
+            None => return FilterResult::pass(node_name),
+        };
+
+        // Split node brands by comma, check if pod brand is in the list
+        let supported: Vec<&str> = node_brands_label.split(',').map(|s| s.trim()).collect();
+
+        if supported.contains(&pod_brand) {
+            FilterResult::pass(node_name)
+        } else {
+            FilterResult::fail(
+                node_name,
+                format!(
+                    "Node does not support zone brand '{}': available brands are {:?}",
+                    pod_brand, supported
+                ),
+            )
+        }
+    }
+
+    fn name(&self) -> &str {
+        "ZoneBrandMatch"
+    }
+}
+
 /// Get default filter predicates
 pub fn default_filters() -> Vec<Box<dyn FilterPredicate>> {
     vec![
+        Box::new(ZoneBrandMatch),
         Box::new(PodFitsResources),
         Box::new(NodeSelectorMatch),
         Box::new(TaintToleration),
@@ -335,5 +391,83 @@ mod tests {
 
         assert!(!result.passed);
         assert!(result.reason.unwrap().contains("Insufficient memory"));
+    }
+
+    fn create_branded_node(name: &str, brands: Option<&str>) -> Node {
+        let mut node = create_test_node(name, "4", "8Gi");
+        if let Some(brands) = brands {
+            node.metadata
+                .labels
+                .get_or_insert_with(BTreeMap::new)
+                .insert("reddwarf.io/zone-brands".to_string(), brands.to_string());
+        }
+        node
+    }
+
+    fn create_branded_pod(brand: Option<&str>) -> Pod {
+        let mut pod = create_test_pod("1", "1Gi");
+        if let Some(brand) = brand {
+            pod.metadata
+                .annotations
+                .get_or_insert_with(BTreeMap::new)
+                .insert("reddwarf.io/zone-brand".to_string(), brand.to_string());
+        }
+        pod
+    }
+
+    #[test]
+    fn test_zone_brand_match_pass() {
+        let node = create_branded_node("node1", Some("reddwarf"));
+        let pod = create_branded_pod(Some("reddwarf"));
+        let context = SchedulingContext::new(pod, vec![node.clone()]);
+
+        let filter = ZoneBrandMatch;
+        let result = filter.filter(&context, &node);
+        assert!(result.passed);
+    }
+
+    #[test]
+    fn test_zone_brand_match_fail() {
+        let node = create_branded_node("node1", Some("reddwarf"));
+        let pod = create_branded_pod(Some("lx"));
+        let context = SchedulingContext::new(pod, vec![node.clone()]);
+
+        let filter = ZoneBrandMatch;
+        let result = filter.filter(&context, &node);
+        assert!(!result.passed);
+        assert!(result.reason.unwrap().contains("does not support zone brand 'lx'"));
+    }
+
+    #[test]
+    fn test_zone_brand_match_no_annotation() {
+        let node = create_branded_node("node1", Some("reddwarf"));
+        let pod = create_branded_pod(None); // no annotation → defaults to "reddwarf"
+        let context = SchedulingContext::new(pod, vec![node.clone()]);
+
+        let filter = ZoneBrandMatch;
+        let result = filter.filter(&context, &node);
+        assert!(result.passed);
+    }
+
+    #[test]
+    fn test_zone_brand_match_no_node_label() {
+        let node = create_branded_node("node1", None); // no label → pass (backward compat)
+        let pod = create_branded_pod(Some("lx"));
+        let context = SchedulingContext::new(pod, vec![node.clone()]);
+
+        let filter = ZoneBrandMatch;
+        let result = filter.filter(&context, &node);
+        assert!(result.passed);
+    }
+
+    #[test]
+    fn test_zone_brand_match_multi_brand() {
+        let node = create_branded_node("node1", Some("reddwarf,lx"));
+        let pod = create_branded_pod(Some("lx"));
+        let context = SchedulingContext::new(pod, vec![node.clone()]);
+
+        let filter = ZoneBrandMatch;
+        let result = filter.filter(&context, &node);
+        assert!(result.passed);
     }
 }

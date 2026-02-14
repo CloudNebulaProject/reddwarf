@@ -93,6 +93,9 @@ enum Commands {
         /// Maximum number of pods this node will accept
         #[arg(long, default_value_t = 110)]
         max_pods: u32,
+        /// Comma-separated list of zone brands this node supports
+        #[arg(long, default_value = "reddwarf")]
+        supported_brands: String,
         #[command(flatten)]
         tls_args: TlsArgs,
     },
@@ -130,6 +133,7 @@ async fn main() -> miette::Result<()> {
             system_reserved_cpu,
             system_reserved_memory,
             max_pods,
+            supported_brands,
             tls_args,
         } => {
             let reserved_cpu_millicores =
@@ -151,6 +155,12 @@ async fn main() -> miette::Result<()> {
                     )
                 })?;
 
+            let supported_brands: Vec<String> = supported_brands
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+
             run_agent(
                 &node_name,
                 &bind,
@@ -165,6 +175,7 @@ async fn main() -> miette::Result<()> {
                 reserved_cpu_millicores,
                 reserved_memory_bytes,
                 max_pods,
+                &supported_brands,
                 &tls_args,
             )
             .await
@@ -265,6 +276,7 @@ async fn run_agent(
     system_reserved_cpu_millicores: i64,
     system_reserved_memory_bytes: i64,
     max_pods: u32,
+    supported_brands: &[String],
     tls_args: &TlsArgs,
 ) -> miette::Result<()> {
     info!("Starting reddwarf agent for node '{}'", node_name);
@@ -378,6 +390,7 @@ async fn run_agent(
     node_agent_config.system_reserved_cpu_millicores = system_reserved_cpu_millicores;
     node_agent_config.system_reserved_memory_bytes = system_reserved_memory_bytes;
     node_agent_config.max_pods = max_pods;
+    node_agent_config.supported_brands = supported_brands.to_vec();
     let node_agent = NodeAgent::new(api_client.clone(), node_agent_config);
     let agent_token = token.clone();
     let node_agent_handle = tokio::spawn(async move {

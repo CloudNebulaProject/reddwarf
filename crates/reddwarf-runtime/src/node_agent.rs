@@ -27,6 +27,8 @@ pub struct NodeAgentConfig {
     pub system_reserved_memory_bytes: i64,
     /// Maximum number of pods this node will accept (default: 110)
     pub max_pods: u32,
+    /// Zone brands this node supports (advertised via `reddwarf.io/zone-brands` label)
+    pub supported_brands: Vec<String>,
 }
 
 impl NodeAgentConfig {
@@ -38,6 +40,7 @@ impl NodeAgentConfig {
             system_reserved_cpu_millicores: 100,
             system_reserved_memory_bytes: 256 * 1024 * 1024,
             max_pods: 110,
+            supported_brands: vec!["reddwarf".into()],
         }
     }
 }
@@ -217,6 +220,10 @@ impl NodeAgent {
                             "node.kubernetes.io/instance-type".to_string(),
                             "reddwarf-zone".to_string(),
                         ),
+                        (
+                            "reddwarf.io/zone-brands".to_string(),
+                            self.config.supported_brands.join(","),
+                        ),
                     ]
                     .into_iter()
                     .collect(),
@@ -351,6 +358,33 @@ mod tests {
             alloc_mem,
             cap_mem,
         );
+    }
+
+    #[test]
+    fn test_build_node_has_brand_labels() {
+        let api_client = Arc::new(ApiClient::new("http://127.0.0.1:6443"));
+        let mut config =
+            NodeAgentConfig::new("test-node".to_string(), "http://127.0.0.1:6443".to_string());
+        config.supported_brands = vec!["reddwarf".into(), "lx".into()];
+        let agent = NodeAgent::new(api_client, config);
+
+        let node = agent.build_node();
+
+        let labels = node.metadata.labels.unwrap();
+        assert_eq!(labels.get("reddwarf.io/zone-brands").unwrap(), "reddwarf,lx");
+    }
+
+    #[test]
+    fn test_build_node_has_brand_labels_default() {
+        let api_client = Arc::new(ApiClient::new("http://127.0.0.1:6443"));
+        let config =
+            NodeAgentConfig::new("test-node".to_string(), "http://127.0.0.1:6443".to_string());
+        let agent = NodeAgent::new(api_client, config);
+
+        let node = agent.build_node();
+
+        let labels = node.metadata.labels.unwrap();
+        assert_eq!(labels.get("reddwarf.io/zone-brands").unwrap(), "reddwarf");
     }
 
     #[test]

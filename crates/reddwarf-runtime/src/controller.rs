@@ -625,9 +625,21 @@ impl PodController {
             None
         };
 
+        let brand = pod
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get("reddwarf.io/zone-brand"))
+            .and_then(|v| match v.as_str() {
+                "lx" => Some(ZoneBrand::Lx),
+                "reddwarf" => Some(ZoneBrand::Reddwarf),
+                _ => None,
+            })
+            .unwrap_or_else(|| self.config.default_brand.clone());
+
         Ok(ZoneConfig {
             zone_name,
-            brand: self.config.default_brand.clone(),
+            brand,
             zonepath,
             network,
             storage: ZoneStorageOpts::default(),
@@ -1108,6 +1120,52 @@ mod tests {
         // handle_delete should return Ok immediately — skipping deprovision
         let result = controller.handle_delete(&pod).await;
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_pod_to_zone_config_brand_from_annotation() {
+        let (controller, _dir) = make_test_controller();
+
+        let mut pod = Pod::default();
+        pod.metadata.name = Some("lx-pod".to_string());
+        pod.metadata.namespace = Some("default".to_string());
+        pod.metadata.annotations = Some(
+            [("reddwarf.io/zone-brand".to_string(), "lx".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        pod.spec = Some(PodSpec {
+            containers: vec![Container {
+                name: "web".to_string(),
+                command: Some(vec!["/bin/sh".to_string()]),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let zone_config = controller.pod_to_zone_config(&pod).unwrap();
+        assert_eq!(zone_config.brand, ZoneBrand::Lx);
+    }
+
+    #[test]
+    fn test_pod_to_zone_config_brand_default() {
+        let (controller, _dir) = make_test_controller();
+
+        let mut pod = Pod::default();
+        pod.metadata.name = Some("default-brand-pod".to_string());
+        pod.metadata.namespace = Some("default".to_string());
+        // No annotations
+        pod.spec = Some(PodSpec {
+            containers: vec![Container {
+                name: "web".to_string(),
+                command: Some(vec!["/bin/sh".to_string()]),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let zone_config = controller.pod_to_zone_config(&pod).unwrap();
+        assert_eq!(zone_config.brand, ZoneBrand::Reddwarf);
     }
 
     #[tokio::test]
