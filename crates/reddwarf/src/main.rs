@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use reddwarf_apiserver::{ApiError, ApiServer, AppState, Config as ApiConfig, TlsMode};
-use reddwarf_core::Namespace;
+use reddwarf_core::{Namespace, ResourceQuantities};
 use reddwarf_runtime::{
     ApiClient, Ipam, MockRuntime, MockStorageEngine, NodeAgent, NodeAgentConfig,
     NodeHealthChecker, NodeHealthCheckerConfig, PodController, PodControllerConfig, StorageEngine,
@@ -84,6 +84,15 @@ enum Commands {
         /// Etherstub name for pod networking
         #[arg(long, default_value = "reddwarf0")]
         etherstub_name: String,
+        /// CPU to reserve for system daemons (e.g. "100m", "0.1")
+        #[arg(long, default_value = "100m")]
+        system_reserved_cpu: String,
+        /// Memory to reserve for system daemons (e.g. "256Mi", "1Gi")
+        #[arg(long, default_value = "256Mi")]
+        system_reserved_memory: String,
+        /// Maximum number of pods this node will accept
+        #[arg(long, default_value_t = 110)]
+        max_pods: u32,
         #[command(flatten)]
         tls_args: TlsArgs,
     },
@@ -118,8 +127,30 @@ async fn main() -> miette::Result<()> {
             zonepath_prefix,
             pod_cidr,
             etherstub_name,
+            system_reserved_cpu,
+            system_reserved_memory,
+            max_pods,
             tls_args,
         } => {
+            let reserved_cpu_millicores =
+                ResourceQuantities::parse_cpu(&system_reserved_cpu).map_err(|e| {
+                    miette::miette!(
+                        help = "Use a value like '100m' or '0.1' for --system-reserved-cpu",
+                        "Invalid --system-reserved-cpu '{}': {}",
+                        system_reserved_cpu,
+                        e
+                    )
+                })?;
+            let reserved_memory_bytes =
+                ResourceQuantities::parse_memory(&system_reserved_memory).map_err(|e| {
+                    miette::miette!(
+                        help = "Use a value like '256Mi' or '1Gi' for --system-reserved-memory",
+                        "Invalid --system-reserved-memory '{}': {}",
+                        system_reserved_memory,
+                        e
+                    )
+                })?;
+
             run_agent(
                 &node_name,
                 &bind,
@@ -131,6 +162,9 @@ async fn main() -> miette::Result<()> {
                 zonepath_prefix.as_deref(),
                 &pod_cidr,
                 &etherstub_name,
+                reserved_cpu_millicores,
+                reserved_memory_bytes,
+                max_pods,
                 &tls_args,
             )
             .await
@@ -228,6 +262,9 @@ async fn run_agent(
     zonepath_prefix: Option<&str>,
     pod_cidr: &str,
     etherstub_name: &str,
+    system_reserved_cpu_millicores: i64,
+    system_reserved_memory_bytes: i64,
+    max_pods: u32,
     tls_args: &TlsArgs,
 ) -> miette::Result<()> {
     info!("Starting reddwarf agent for node '{}'", node_name);
@@ -337,7 +374,10 @@ async fn run_agent(
     });
 
     // 6. Spawn node agent
-    let node_agent_config = NodeAgentConfig::new(node_name.to_string(), api_url);
+    let mut node_agent_config = NodeAgentConfig::new(node_name.to_string(), api_url);
+    node_agent_config.system_reserved_cpu_millicores = system_reserved_cpu_millicores;
+    node_agent_config.system_reserved_memory_bytes = system_reserved_memory_bytes;
+    node_agent_config.max_pods = max_pods;
     let node_agent = NodeAgent::new(api_client.clone(), node_agent_config);
     let agent_token = token.clone();
     let node_agent_handle = tokio::spawn(async move {

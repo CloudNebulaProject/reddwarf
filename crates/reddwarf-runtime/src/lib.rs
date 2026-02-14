@@ -13,6 +13,7 @@ pub mod network;
 pub mod node_agent;
 pub mod node_health;
 pub mod storage;
+pub mod sysinfo;
 pub mod traits;
 pub mod types;
 pub mod zone;

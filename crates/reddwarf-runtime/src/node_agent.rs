@@ -1,5 +1,8 @@
 use crate::api_client::ApiClient;
 use crate::error::{Result, RuntimeError};
+use crate::sysinfo::{
+    compute_node_resources, format_memory_quantity, NodeResources, ResourceReservation,
+};
 use k8s_openapi::api::core::v1::{Node, NodeAddress, NodeCondition, NodeStatus};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -18,6 +21,12 @@ pub struct NodeAgentConfig {
     pub api_url: String,
     /// Interval between heartbeats
     pub heartbeat_interval: Duration,
+    /// CPU to reserve for system daemons, in millicores (default: 100 = 100m)
+    pub system_reserved_cpu_millicores: i64,
+    /// Memory to reserve for system daemons, in bytes (default: 256Mi)
+    pub system_reserved_memory_bytes: i64,
+    /// Maximum number of pods this node will accept (default: 110)
+    pub max_pods: u32,
 }
 
 impl NodeAgentConfig {
@@ -26,6 +35,9 @@ impl NodeAgentConfig {
             node_name,
             api_url,
             heartbeat_interval: Duration::from_secs(10),
+            system_reserved_cpu_millicores: 100,
+            system_reserved_memory_bytes: 256 * 1024 * 1024,
+            max_pods: 110,
         }
     }
 }
@@ -34,11 +46,56 @@ impl NodeAgentConfig {
 pub struct NodeAgent {
     api_client: Arc<ApiClient>,
     config: NodeAgentConfig,
+    /// Detected system resources (None if detection failed at startup).
+    detected: Option<NodeResources>,
 }
 
 impl NodeAgent {
     pub fn new(api_client: Arc<ApiClient>, config: NodeAgentConfig) -> Self {
-        Self { api_client, config }
+        let reservation = ResourceReservation {
+            cpu_millicores: config.system_reserved_cpu_millicores,
+            memory_bytes: config.system_reserved_memory_bytes,
+        };
+
+        let detected = match compute_node_resources(&reservation, config.max_pods) {
+            Ok(nr) => {
+                info!(
+                    cpu_count = nr.capacity.cpu_count,
+                    total_memory = %format_memory_quantity(nr.capacity.total_memory_bytes),
+                    allocatable_cpu_m = nr.allocatable_cpu_millicores,
+                    allocatable_memory = %format_memory_quantity(nr.allocatable_memory_bytes),
+                    max_pods = nr.max_pods,
+                    "Detected system resources"
+                );
+                Some(nr)
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to detect system resources, falling back to defaults"
+                );
+                None
+            }
+        };
+
+        Self {
+            api_client,
+            config,
+            detected,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_detected(
+        api_client: Arc<ApiClient>,
+        config: NodeAgentConfig,
+        detected: Option<NodeResources>,
+    ) -> Self {
+        Self {
+            api_client,
+            config,
+            detected,
+        }
     }
 
     /// Register this host as a Node resource
@@ -108,21 +165,47 @@ impl NodeAgent {
     fn build_node(&self) -> Node {
         let hostname = self.config.node_name.clone();
 
-        let cpu_count = std::thread::available_parallelism()
-            .map(|n| n.get().to_string())
-            .unwrap_or_else(|_| "1".to_string());
+        let (capacity, allocatable) = if let Some(ref nr) = self.detected {
+            let cap_cpu = nr.capacity.cpu_count.to_string();
+            let cap_mem = format_memory_quantity(nr.capacity.total_memory_bytes);
+            let pods = nr.max_pods.to_string();
 
-        let allocatable = BTreeMap::from([
-            ("cpu".to_string(), Quantity(cpu_count.clone())),
-            ("memory".to_string(), Quantity("8Gi".to_string())),
-            ("pods".to_string(), Quantity("110".to_string())),
-        ]);
+            let alloc_cpu = format!("{}m", nr.allocatable_cpu_millicores);
+            let alloc_mem = format_memory_quantity(nr.allocatable_memory_bytes);
 
-        let capacity = BTreeMap::from([
-            ("cpu".to_string(), Quantity(cpu_count)),
-            ("memory".to_string(), Quantity("8Gi".to_string())),
-            ("pods".to_string(), Quantity("110".to_string())),
-        ]);
+            let capacity = BTreeMap::from([
+                ("cpu".to_string(), Quantity(cap_cpu)),
+                ("memory".to_string(), Quantity(cap_mem)),
+                ("pods".to_string(), Quantity(pods.clone())),
+            ]);
+
+            let allocatable = BTreeMap::from([
+                ("cpu".to_string(), Quantity(alloc_cpu)),
+                ("memory".to_string(), Quantity(alloc_mem)),
+                ("pods".to_string(), Quantity(pods)),
+            ]);
+
+            (capacity, allocatable)
+        } else {
+            // Fallback: use available_parallelism for CPU, hardcoded memory
+            let cpu_count = std::thread::available_parallelism()
+                .map(|n| n.get().to_string())
+                .unwrap_or_else(|_| "1".to_string());
+
+            let capacity = BTreeMap::from([
+                ("cpu".to_string(), Quantity(cpu_count.clone())),
+                ("memory".to_string(), Quantity("8Gi".to_string())),
+                ("pods".to_string(), Quantity("110".to_string())),
+            ]);
+
+            let allocatable = BTreeMap::from([
+                ("cpu".to_string(), Quantity(cpu_count)),
+                ("memory".to_string(), Quantity("8Gi".to_string())),
+                ("pods".to_string(), Quantity("110".to_string())),
+            ]);
+
+            (capacity, allocatable)
+        };
 
         Node {
             metadata: ObjectMeta {
@@ -169,6 +252,7 @@ impl NodeAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sysinfo::detect_system_resources;
 
     #[test]
     fn test_node_agent_config_defaults() {
@@ -176,6 +260,9 @@ mod tests {
             NodeAgentConfig::new("test-node".to_string(), "http://127.0.0.1:6443".to_string());
         assert_eq!(config.node_name, "test-node");
         assert_eq!(config.heartbeat_interval, Duration::from_secs(10));
+        assert_eq!(config.system_reserved_cpu_millicores, 100);
+        assert_eq!(config.system_reserved_memory_bytes, 256 * 1024 * 1024);
+        assert_eq!(config.max_pods, 110);
     }
 
     #[test]
@@ -206,25 +293,90 @@ mod tests {
         let node = agent.build_node();
         let status = node.status.unwrap();
 
-        // Check allocatable
+        // Check allocatable has all keys
         let alloc = status.allocatable.unwrap();
         assert!(alloc.contains_key("cpu"));
         assert!(alloc.contains_key("memory"));
         assert!(alloc.contains_key("pods"));
-        assert_eq!(alloc["memory"].0, "8Gi");
         assert_eq!(alloc["pods"].0, "110");
 
-        // CPU should match available parallelism
+        // Memory should come from detected system (not hardcoded 8Gi)
+        let sys = detect_system_resources().expect("detection works in test");
+        let expected_cap_mem = format_memory_quantity(sys.total_memory_bytes);
+        let cap = status.capacity.unwrap();
+        assert_eq!(cap["memory"].0, expected_cap_mem);
+
+        // Capacity CPU should match detected cpu_count
+        assert_eq!(cap["cpu"].0, sys.cpu_count.to_string());
+    }
+
+    #[test]
+    fn test_build_node_allocatable_less_than_capacity() {
+        let api_client = Arc::new(ApiClient::new("http://127.0.0.1:6443"));
+        let config =
+            NodeAgentConfig::new("test-node".to_string(), "http://127.0.0.1:6443".to_string());
+        let agent = NodeAgent::new(api_client, config);
+
+        // Agent should have detected resources (we're on a real host)
+        assert!(agent.detected.is_some(), "detection should succeed in tests");
+
+        let node = agent.build_node();
+        let status = node.status.unwrap();
+        let cap = status.capacity.unwrap();
+        let alloc = status.allocatable.unwrap();
+
+        // Allocatable CPU (millicores) should be less than capacity CPU (whole cores)
+        let cap_cpu_m = reddwarf_core::resources::ResourceQuantities::parse_cpu(&cap["cpu"].0)
+            .expect("valid cpu");
+        let alloc_cpu_m =
+            reddwarf_core::resources::ResourceQuantities::parse_cpu(&alloc["cpu"].0)
+                .expect("valid cpu");
+        assert!(
+            alloc_cpu_m < cap_cpu_m,
+            "allocatable CPU {}m should be less than capacity {}m",
+            alloc_cpu_m,
+            cap_cpu_m,
+        );
+
+        // Allocatable memory should be less than capacity memory
+        let cap_mem =
+            reddwarf_core::resources::ResourceQuantities::parse_memory(&cap["memory"].0)
+                .expect("valid mem");
+        let alloc_mem =
+            reddwarf_core::resources::ResourceQuantities::parse_memory(&alloc["memory"].0)
+                .expect("valid mem");
+        assert!(
+            alloc_mem < cap_mem,
+            "allocatable memory {} should be less than capacity {}",
+            alloc_mem,
+            cap_mem,
+        );
+    }
+
+    #[test]
+    fn test_build_node_fallback_on_detection_failure() {
+        let api_client = Arc::new(ApiClient::new("http://127.0.0.1:6443"));
+        let config =
+            NodeAgentConfig::new("test-node".to_string(), "http://127.0.0.1:6443".to_string());
+        // Simulate detection failure
+        let agent = NodeAgent::new_with_detected(api_client, config, None);
+
+        let node = agent.build_node();
+        let status = node.status.unwrap();
+        let alloc = status.allocatable.unwrap();
+        let cap = status.capacity.unwrap();
+
+        // Should fall back to hardcoded defaults
+        assert_eq!(alloc["memory"].0, "8Gi");
+        assert_eq!(alloc["pods"].0, "110");
+        assert_eq!(cap["memory"].0, "8Gi");
+        assert_eq!(cap["pods"].0, "110");
+
+        // CPU falls back to available_parallelism
         let expected_cpu = std::thread::available_parallelism()
             .map(|n| n.get().to_string())
             .unwrap_or_else(|_| "1".to_string());
         assert_eq!(alloc["cpu"].0, expected_cpu);
-
-        // Check capacity
-        let cap = status.capacity.unwrap();
-        assert!(cap.contains_key("cpu"));
-        assert!(cap.contains_key("memory"));
-        assert!(cap.contains_key("pods"));
         assert_eq!(cap["cpu"].0, expected_cpu);
     }
 }

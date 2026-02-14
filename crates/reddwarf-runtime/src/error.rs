@@ -144,6 +144,17 @@ pub enum RuntimeError {
         message: String,
     },
 
+    /// Resource detection failed
+    #[error("Failed to detect system resources: {message}")]
+    #[diagnostic(
+        code(reddwarf::runtime::resource_detection_failed),
+        help("System resource detection is non-fatal. The node agent will fall back to default values (CPU from available_parallelism, 8Gi memory, 110 pods). To investigate, check that /proc/meminfo is readable (Linux) or that the system supports sysconf (illumos/macOS)")
+    )]
+    ResourceDetectionFailed {
+        #[allow(unused)]
+        message: String,
+    },
+
     /// Internal error
     #[error("Internal runtime error: {message}")]
     #[diagnostic(
@@ -221,6 +232,12 @@ impl RuntimeError {
             from: from.into(),
             to: to.into(),
             required: required.into(),
+        }
+    }
+
+    pub fn resource_detection_failed(message: impl Into<String>) -> Self {
+        Self::ResourceDetectionFailed {
+            message: message.into(),
         }
     }
 

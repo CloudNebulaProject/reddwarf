@@ -24,6 +24,7 @@ async-trait = { workspace = true }
 reqwest = { workspace = true }
 chrono = { workspace = true }
 futures-util = { workspace = true }
+sys-info = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
